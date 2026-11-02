@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Secrets & Keys
+secrets/*.pem
+secrets/*.key
+*.pem
+!.github/**/*.pem
+
+# Video / Media Artifacts
+videos/*.mp4
+videos/*.webm
+videos/*.
