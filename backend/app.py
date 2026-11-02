@@ -1012,7 +1012,7 @@ async def lifespan(app: FastAPI):
             except Exception: pass
 
 app = FastAPI(title="V2E SOTA Multi-Tab Bitemporal Engine v8", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 
 async def verify_subscriber_optional(authorization: Optional[str] = Header(default=None)) -> Optional[SubscriberClaims]:
     if not authorization or not authorization.startswith("Bearer "):
@@ -1043,12 +1043,12 @@ def healthcheck():
     return {"status": "ok", "video_id": engine.manifest.video_id}
 
 @app.get("/")
-def serve_ui(): return FileResponse("static/index.html")
+def serve_ui(): return FileResponse(str(Path(__file__).resolve().parent / "static/index.html"))
 
 @app.get("/tab/{tab_id}")
 def serve_detached_tab_ui(tab_id: str):
     if tab_id not in engine.active_tabs: raise HTTPException(404, "Detached tab not found")
-    return FileResponse("static/index.html")
+    return FileResponse(str(Path(__file__).resolve().parent / "static/index.html"))
 
 @app.get("/api/video")
 def serve_video():

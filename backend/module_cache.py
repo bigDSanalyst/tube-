@@ -185,7 +185,7 @@ class VerifiedModuleCache:
         target_dir.mkdir(mode=0o700)
 
         try:
-            git_safe_flags = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=local"]
+            git_safe_flags = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"]
             subprocess.run(git_safe_flags + ["init", "--bare", str(bare_dir)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
             subprocess.run(git_safe_flags + ["-C", str(bare_dir), "fetch", "--no-tags", "--depth", "1", mod.repo_url, mod.commit_sha], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
 

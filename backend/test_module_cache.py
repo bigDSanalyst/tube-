@@ -1,10 +1,17 @@
+import asyncio
 import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+# Ensure backend/ is on sys.path whether invoked from repo root or backend/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from module_cache import (
     CANONICAL_TREE_HASH_VERSION,
@@ -14,12 +21,14 @@ from module_cache import (
     compute_git_commit_tree_sha256,
 )
 
+
 def _git(cwd: Path, *args: str) -> str:
     res = subprocess.run(
         ["git", "-C", str(cwd)] + list(args),
         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     return res.stdout.strip()
+
 
 class TestVerifiedModuleCacheV91(unittest.TestCase):
     def setUp(self):
@@ -149,6 +158,110 @@ class TestVerifiedModuleCacheV91(unittest.TestCase):
         self.assertIn("rolling_mod", cache.refused_modules)
         with self.assertRaises(RuntimeError):
             cache.materialize_into_sandbox("rolling_mod", self.sandbox_home, os.getuid(), os.getgid())
+
+    def test_6_immutable_but_repushed_tree_fails_tree_sha256(self):
+        (self.repo_dir / "main.py").write_text("v1\n", encoding="utf-8")
+        _git(self.repo_dir, "add", ".")
+        _git(self.repo_dir, "commit", "-m", "v1")
+        sha_v1 = _git(self.repo_dir, "rev-parse", "HEAD")
+
+        mod = LinkedModule(
+            module_id="immutable_tamper",
+            repo_url=f"file://{self.repo_dir}",
+            commit_sha=sha_v1,
+            tree_sha256="b" * 64,
+            entrypoint_file="main.py",
+            timestamp_ms=0,
+            cache_policy="immutable",
+        )
+        cache = VerifiedModuleCache(cache_root=self.cache_dir)
+        with self.assertRaises(RuntimeError):
+            cache.ingest_all_at_startup([mod], require_all=True)
+        self.assertFalse((self.cache_dir / "immutable_tamper").exists())
+
+    def test_7_manifest_json_dict_to_linked_module_bridge(self):
+        from app import PublisherManifest
+
+        (self.repo_dir / "app.py").write_text("print('bridge')\n", encoding="utf-8")
+        _git(self.repo_dir, "add", ".")
+        _git(self.repo_dir, "commit", "-m", "bridge")
+        sha = _git(self.repo_dir, "rev-parse", "HEAD")
+        tree_hash = compute_git_commit_tree_sha256(self.repo_dir, sha)
+
+        raw_manifest = {
+            "video_id": "vid_009",
+            "publisher_id": "pub_alpha",
+            "signed_at": 1700000000,
+            "linked_modules": [
+                {
+                    "module_id": "mod_bridge",
+                    "repo_url": f"file://{self.repo_dir}",
+                    "commit_sha": sha,
+                    "tree_sha256": tree_hash,
+                    "entrypoint_file": "app.py",
+                    "timestamp_ms": 5000,
+                }
+            ],
+        }
+        with self.assertRaises(AttributeError):
+            _ = [m.module_id for m in raw_manifest["linked_modules"]]
+
+        pm = PublisherManifest(**raw_manifest)
+        self.assertIsInstance(pm.linked_modules[0], LinkedModule)
+        serialized = asdict(pm.linked_modules[0])
+        self.assertEqual(serialized["module_id"], "mod_bridge")
+        self.assertEqual(serialized["tree_sha256_algo"], CANONICAL_TREE_HASH_VERSION)
+
+    def test_8_step3b_single_heap_push_on_materialize_failure_and_step4_serialization(self):
+        from fastapi import HTTPException
+        from app import CapabilityToken, HardenedBitemporalEngine, PublisherManifest, SpawnTabRequest
+
+        (self.repo_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
+        _git(self.repo_dir, "add", ".")
+        _git(self.repo_dir, "commit", "-m", "init")
+        sha = _git(self.repo_dir, "rev-parse", "HEAD")
+        tree_hash = compute_git_commit_tree_sha256(self.repo_dir, sha)
+
+        mod = LinkedModule(
+            module_id="mod_live",
+            repo_url=f"file://{self.repo_dir}",
+            commit_sha=sha,
+            tree_sha256=tree_hash,
+            entrypoint_file="main.py",
+            timestamp_ms=1000,
+        )
+
+        eng = HardenedBitemporalEngine()
+        eng.manifest = PublisherManifest(
+            video_id="vid_009",
+            publisher_id="pub_alpha",
+            signed_at=1700000000,
+            linked_modules=[mod],
+        )
+        eng.module_cache = VerifiedModuleCache(cache_root=self.cache_dir)
+        eng.module_cache.ingest_all_at_startup(eng.manifest.linked_modules, require_all=True)
+
+        serialized_mods = eng.serialize_linked_modules()
+        self.assertEqual(len(serialized_mods), 1)
+        self.assertTrue(serialized_mods[0]["available"])
+
+        os.symlink("/etc/passwd", self.cache_dir / "mod_live" / "tamper_link")
+
+        cap = CapabilityToken(token="tok_1", user_id="user_1", tier="paid", issued_at=1.0)
+        req = SpawnTabRequest(component_type="FULL_WORKSPACE", replay_from_ms=1000, module_id="mod_live")
+
+        async def _run():
+            with patch("app.subprocess.Popen") as mock_popen, \
+                 patch.object(eng, "_prepare_sandbox_dir", new=AsyncMock(return_value=(str(self.sandbox_home), "/tmp/s", "/tmp/x"))), \
+                 patch.object(eng, "_cleanup_sandbox_xauth", new=AsyncMock()):
+                with self.assertRaises(HTTPException) as ctx:
+                    await eng.spawn_detached_tab_sandbox(req, cap)
+                self.assertEqual(ctx.exception.status_code, 503)
+                mock_popen.assert_not_called()
+
+        asyncio.run(_run())
+        self.assertEqual(eng.free_display_heap, [101])
+
 
 if __name__ == "__main__":
     unittest.main()
