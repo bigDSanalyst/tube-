@@ -8,13 +8,41 @@ env/
 .pytest_cache/
 .mypy_cache/
 
-# Secrets & Keys
+# Secrets & Keys (NEVER commit these)
 secrets/*.pem
 secrets/*.key
+secrets/*.sig
 *.pem
-!.github/**/*.pem
+.env*
+!.env.example
 
-# Video / Media Artifacts
+# Video / Media / Runtime Artifacts
 videos/*.mp4
 videos/*.webm
-videos/*.
+videos/*.mov
+videos/*.ledger.json
+checkpoints/*
+manifests/*.json
+manifests/*.sig
+
+# Node / Frontend (future-proofing)
+node_modules/
+build/
+dist/
+coverage/
+
+# Runtime state
+app/.v2e_master_xauth
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Preserve directory structure
+!secrets/.gitkeep
+!videos/.gitkeep
+!checkpoints/.gitkeep
+!manifests/.gitkeep
