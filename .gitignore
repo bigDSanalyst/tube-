@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Secrets
+secrets/*.pem
+*.pem
+.env*
+
+# Backend runtime
+backend/videos/*.mp4
+backend/checkpoints/*
+backend/manifests/*.json
+backend/manifests/*.sig
+
+# AI Studio artifacts
+.aistudio/
+node_modules/
+dist/
+build/
+
+# Big screenshots
+v8-*.png
+
+# OS
+.DS_Store
+*.log

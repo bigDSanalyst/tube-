@@ -1,0 +1,43 @@
+services:
+  v2e-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: v2e_bitemporal_v8
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./videos:/app/videos
+      - ./checkpoints:/app/checkpoints
+      - ./manifests:/app/manifests:ro
+    environment:
+      - DISPLAY_TRUNK=:99
+      - SANDBOX_RES=1024x768x24
+      - V2E_REQUIRE_AUTH=1
+      - PYTHONUNBUFFERED=1
+    secrets:
+      - publisher_manifest_pub
+      - publisher_auth_pub
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+secrets:
+  publisher_manifest_pub:
+    file: ./secrets/publisher_manifest_pub.pem
+  publisher_auth_pub:
+    file: ./secrets/publisher_auth_pub.pem

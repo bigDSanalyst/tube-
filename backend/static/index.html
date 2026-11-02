@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>V2E SOTA Multi-Tab Studio v8</title>
+  <style>
+    :root{--bg:#0b0f17;--panel:#161b22;--border:#30363d;--cyan:#38bdf8;--amber:#f59e0b;
+          --green:#3fb950;--purple:#a855f7;--red:#ef4444;--text:#e6edf3;}
+    *{box-sizing:border-box;margin:0;padding:0;font-family:system-ui,sans-serif;}
+    body{background:var(--bg);color:var(--text);display:flex;height:100vh;overflow:hidden;}
+    .stage{flex:1;display:flex;flex-direction:column;padding:14px;gap:10px;overflow-y:auto;}
+    .top{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;
+         background:var(--panel);padding:10px 14px;border-radius:8px;border:1px solid var(--border);}
+    .popout-group{display:flex;gap:6px;flex-wrap:wrap;}
+    .vp{position:relative;width:100%;max-width:1100px;aspect-ratio:16/9;background:#000;
+        border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+    video{width:100%;height:100%;object-fit:fill;display:block;}
+    #subscreenCanvas{position:absolute;left:3.125%;top:5.55%;width:71.875%;height:83.33%;
+        border:2px solid transparent;border-radius:6px;cursor:crosshair;z-index:2;
+        transition:border-color .15s;}
+    #subscreenCanvas.forked{border-color:var(--green);box-shadow:0 0 20px rgba(63,185,80,.35);}
+    #subscreenCanvas.detached{position:static;width:100%;height:100%;
+        border:2px solid var(--purple);cursor:default;}
+    #speakerHitbox{position:absolute;left:76.56%;top:66.66%;width:20.31%;height:27.77%;
+        border:2px dashed var(--amber);border-radius:8px;z-index:3;cursor:pointer;
+        display:flex;align-items:flex-end;justify-content:center;padding-bottom:6px;
+        font-size:11px;color:var(--amber);font-weight:700;letter-spacing:.06em;
+        background:rgba(245,158,11,.08);text-shadow:0 1px 2px #000;text-align:center;}
+
+    .hud{display:flex;gap:14px;align-items:center;font-size:12px;color:#8b949e;
+        padding:0 4px;flex-wrap:wrap;}
+    .hud .badge{padding:3px 8px;border-radius:10px;font-size:11px;
+        background:#21262d;border:1px solid var(--border);font-family:monospace;}
+    .hud .badge.sub-locked{background:rgba(239,68,68,.12);color:var(--red);
+        border-color:rgba(239,68,68,.4);}
+    .popout-btn{padding:6px 10px;border-radius:6px;font-size:12px;font-weight:600;
+        border:1px solid var(--border);background:#21262d;color:var(--text);
+        cursor:pointer;transition:all .15s;}
+    .popout-btn:hover:not(:disabled){background:#30363d;border-color:var(--cyan);}
+    .popout-btn:disabled{opacity:.4;cursor:not-allowed;}
+
+    .sidebar{width:340px;display:flex;flex-direction:column;background:var(--panel);
+        border-left:1px solid var(--border);overflow:hidden;}
+    .sidebar-header{padding:12px 14px;border-bottom:1px solid var(--border);
+        font-size:12px;font-weight:700;letter-spacing:.08em;color:var(--cyan);}
+    .ledger{flex:1;overflow-y:auto;padding:10px;}
+    .ledger-node{padding:8px 10px;border-radius:6px;margin-bottom:6px;
+        background:#0d1117;border:1px solid var(--border);font-size:12px;}
+    .ledger-node .ts{color:var(--cyan);font-family:monospace;font-size:11px;}
+    .ledger-node .cmd{color:var(--green);font-family:monospace;font-size:11px;
+        margin-top:4px;word-break:break-all;}
+
+    .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+        padding:10px 18px;background:#21262d;border:1px solid var(--border);
+        border-radius:8px;font-size:13px;z-index:100;opacity:0;
+        transition:opacity .2s;pointer-events:none;max-width:90vw;
+        box-shadow:0 8px 24px rgba(0,0,0,.5);}
+    .toast.show{opacity:1;}
+
+    #wsCanvas{position:absolute;left:3.125%;top:5.55%;width:71.875%;height:83.33%;z-index:1;
+        display:none;background:#000;pointer-events:none;border-radius:6px;}
+    #wsCanvas.forked{display:block;}
+
+    body.detached{display:block;padding:0;background:#000;overflow:hidden;}
+    body.detached .top,body.detached .sidebar,body.detached .vp>video,
+    body.detached #speakerHitbox,body.detached .hud{display:none;}
+    body.detached .stage{height:100vh;padding:0;gap:0;overflow:hidden;max-width:none;}
+    body.detached .vp{max-width:none;width:100vw;height:100vh;aspect-ratio:auto;
+        border:none;border-radius:0;}
+    body.detached #subscreenCanvas.detached{border:none;cursor:crosshair;}
+    body.detached #wsCanvas{display:block;left:0;top:0;width:100%;height:100%;border-radius:0;}
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <div class="top">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <strong style="font-size:14px;">V2E Multi-Tab Studio v8</strong>
+        <span id="manifestInfo" style="font-size:11px;color:#8b949e;font-family:monospace;"></span>
+      </div>
+      <div class="hud">
+        <span id="subBadge" class="badge">…</span>
+        <div class="popout-group" id="popoutGroup">
+          <button class="popout-btn" data-component="FULL_WORKSPACE" disabled>Full Workspace</button>
+          <button class="popout-btn" data-component="IDE_EDITOR" disabled>Code Editor</button>
+          <button class="popout-btn" data-component="TERMINAL" disabled>Terminal</button>
+          <button class="popout-btn" data-component="VIEWPORT_PREVIEW" disabled>Viewport</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="vp" id="vpRoot">
+      <video id="vid" autoplay muted loop playsinline></video>
+      <canvas id="subscreenCanvas" width="920" height="600"></canvas>
+      <div id="speakerHitbox">SPEAKER STREAM</div>
+      <canvas id="wsCanvas"></canvas>
+    </div>
+
+    <div class="hud">
+      <span id="forkStatus">Workspace: shared trunk</span>
+      <span id="speakerStatus">Speaker: playing</span>
+      <span id="tabCount">Tabs: 0</span>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <div class="sidebar-header">BITEMPORAL SYNC LEDGER</div>
+    <div class="ledger" id="ledgerList"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  const state = {
+    capToken: null, canPopout: false, subscriber: null, manifest: null,
+    ledger: [], linkedModules: [], activeTabs: [], workspaceForked: false,
+    speakerPlaying: true, forkDisplay: null, detachedTabId: null, detachedDisplay: null,
+    detachedComponent: null, detachedMs: 0, wsConn: null, sseConn: null,
+    sseRetryCount: 0, lastSpeakerMs: 0, bootstrapped: false,
+  };
+
+  const pathMatch = location.pathname.match(/^\/tab\/([^/]+)$/);
+  if (pathMatch) {
+    state.detachedTabId = decodeURIComponent(pathMatch[1]);
+    const qs = new URLSearchParams(location.search);
+    state.detachedDisplay = qs.get('display');
+    state.detachedComponent = qs.get('component');
+    state.detachedMs = parseInt(qs.get('ms') || '0', 10) || 0;
+    document.body.classList.add('detached');
+  }
+
+  const $ = (id) => document.getElementById(id);
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  function toast(msg, ms) {
+    const t = $('toast');
+    if (!t) return;
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(t._t);
+    t._t = setTimeout(() => t.classList.remove('show'), ms || 2500);
+  }
+
+  function getSpeakerMs() {
+    if (state.detachedTabId) return state.lastSpeakerMs || 0;
+    const v = $('vid');
+    return v ? Math.floor(v.currentTime * 1000) : 0;
+  }
+
+  function apiHeaders(extra) {
+    const h = Object.assign({}, extra || {});
+    if (state.capToken) h['X-V2E-Cap-Token'] = state.capToken;
+    return h;
+  }
+
+  function syncCapTokenStorage() {
+    try {
+      if (state.capToken) localStorage.setItem('v2e_cap_token', state.capToken);
+      else localStorage.removeItem('v2e_cap_token');
+    } catch (_) {}
+  }
+
+  async function fetchOneTimeTicket() {
+    const res = await fetch('/api/ws-ticket', { method: 'POST', headers: apiHeaders({}) });
+    if (!res.ok) throw new Error('ticket ' + res.status);
+    const j = await res.json();
+    return j.ticket;
+  }
+
+  async function bootstrap() {
+    try {
+      const cached = localStorage.getItem('v2e_cap_token');
+      if (cached && !state.capToken) state.capToken = cached;
+    } catch (_) {}
+
+    if (state.detachedTabId && state.capToken) {
+      fetch('/api/tabs/' + encodeURIComponent(state.detachedTabId) + '/touch', { method: 'POST', headers: apiHeaders({}) }).catch(() => {});
+    }
+
+    try {
+      const res = await fetch('/api/ledger', { headers: apiHeaders({}) });
+      if (!res.ok) throw new Error('ledger ' + res.status);
+      const data = await res.json();
+      state.capToken = data.capability_token || null;
+      state.canPopout = !!data.can_popout;
+      state.subscriber = data.subscriber;
+      state.manifest = data.manifest;
+      state.ledger = data.nodes || [];
+      state.linkedModules = data.linked_modules || [];
+      state.activeTabs = data.active_tabs || [];
+      state.workspaceForked = !!data.workspace_forked;
+      state.forkDisplay = data.fork_display || null;
+      syncCapTokenStorage();
+    } catch (e) {
+      toast('Failed to load engine state: ' + e.message);
+      console.error(e);
+    }
+
+    if (!state.detachedTabId) {
+      const v = $('vid');
+      if (v) v.src = '/api/video';
+    }
+
+    applyLedger();
+    applySubscriberBadge();
+    applyPopoutState();
+    applyWorkspaceState();
+    wireUI();
+    setupBroadcastChannel();
+    await connectSSE();
+    await connectSubscreenWS();
+    state.bootstrapped = true;
+  }
+
+  function applyLedger() {
+    const list = $('ledgerList');
+    if (!list) return;
+    const frag = document.createDocumentFragment();
+    for (const n of state.ledger) {
+      const div = document.createElement('div');
+      div.className = 'ledger-node';
+      const matchedModule = (state.linkedModules || []).find((m) => Math.abs(m.timestamp_ms - n.timestamp_ms) < 2000);
+      let actionHtml = '';
+      if (matchedModule) {
+        const filename = matchedModule.entrypoint_file.split('/').pop();
+        const disabledAttr = matchedModule.available ? '' : 'disabled';
+        const titleAttr = matchedModule.available ? 'Open ' + matchedModule.entrypoint_file : (matchedModule.disabled_reason || 'Module unavailable');
+        const badgeText = matchedModule.available ? 'Verified' : 'Refused';
+        const badgeColor = matchedModule.available ? 'var(--green)' : 'var(--red)';
+        actionHtml = `
+          <div style="margin-top:6px;display:flex;align-items:center;gap:8px;">
+            <button class="popout-btn module-spawn-btn" data-module-id="${escapeHtml(matchedModule.module_id)}" ${disabledAttr} title="${escapeHtml(titleAttr)}" style="font-size:11px;padding:3px 8px;">
+              📂 Open ${escapeHtml(filename)}
+            </button>
+            <span style="font-size:10px;color:${badgeColor};font-family:monospace;">${badgeText}</span>
+          </div>
+        `;
+      }
+      div.innerHTML = '<div class="ts">t=' + n.timestamp_ms + 'ms  #' + n.node_id + '</div>' + '<div>' + escapeHtml(n.spoken_text) + '</div>' + '<div class="cmd">$ ' + escapeHtml(n.inferred_cmd) + '</div>' + actionHtml;
+      frag.appendChild(div);
+    }
+    list.innerHTML = '';
+    list.appendChild(frag);
+    const mi = $('manifestInfo');
+    if (mi && state.manifest) mi.textContent = 'video=' + state.manifest.video_id + ' · tier=' + state.manifest.min_subscriber_tier;
+  }
+
+  function applySubscriberBadge() {
+    const badge = $('subBadge');
+    if (!badge) return;
+    if (state.subscriber) {
+      badge.textContent = state.subscriber.tier.toUpperCase() + ' · ' + state.subscriber.user_id;
+      badge.classList.remove('sub-locked');
+    } else {
+      badge.textContent = 'FREE VIEWER';
+      badge.classList.add('sub-locked');
+    }
+  }
+
+  function applyPopoutState() {
+    const reason = state.canPopout ? '' : 'Subscribe for pop-outs';
+    for (const btn of document.querySelectorAll('.popout-btn')) {
+      if (btn.classList.contains('module-spawn-btn')) continue;
+      btn.disabled = !state.canPopout;
+      btn.title = reason;
+    }
+  }
+
+  function applyWorkspaceState() {
+    const f = $('forkStatus'), s = $('speakerStatus'), t = $('tabCount');
+    if (f) f.textContent = state.workspaceForked ? 'Workspace: forked ' + (state.forkDisplay || '') : 'Workspace: shared trunk';
+    if (s) s.textContent = state.speakerPlaying ? 'Speaker: playing' : 'Speaker: paused';
+    if (t) t.textContent = 'Tabs: ' + state.activeTabs.length;
+    const canvas = $('subscreenCanvas');
+    if (canvas) {
+      canvas.classList.toggle('forked', state.workspaceForked);
+      canvas.classList.toggle('detached', !!state.detachedTabId);
+    }
+    const wsCanvas = $('wsCanvas');
+    if (wsCanvas) wsCanvas.classList.toggle('forked', state.workspaceForked);
+    const v = $('vid');
+    if (v && !state.detachedTabId) {
+      if (state.speakerPlaying && v.paused) v.play().catch(() => {});
+      else if (!state.speakerPlaying && !v.paused) v.pause();
+    }
+  }
+
+  function wireUI() {
+    for (const btn of document.querySelectorAll('.popout-btn')) {
+      if (btn.classList.contains('module-spawn-btn')) continue;
+      btn.addEventListener('click', () => spawnTab(btn.dataset.component));
+    }
+    const ledgerList = $('ledgerList');
+    if (ledgerList) {
+      ledgerList.addEventListener('click', (e) => {
+        const btn = e.target.closest('.module-spawn-btn');
+        if (btn && !btn.disabled) spawnTabWithModule(btn.dataset.moduleId);
+      });
+    }
+    const canvas = $('subscreenCanvas');
+    if (canvas) {
+      canvas.addEventListener('click', (e) => {
+        const r = canvas.getBoundingClientRect();
+        const normX = (e.clientX - r.left) / Math.max(r.width, 1);
+        const normY = (e.clientY - r.top) / Math.max(r.height, 1);
+        if (state.detachedTabId) sendPointer(Math.round(normX * 1280), Math.round(normY * 720), state.detachedDisplay);
+        else sendPointer(Math.round(40 + normX * 920), Math.round(40 + normY * 600), null);
+      });
+    }
+    const sp = $('speakerHitbox');
+    if (sp) sp.addEventListener('click', () => sendPointer(1100, 580, null));
+    window.addEventListener('keydown', handleKeydown, { capture: true });
+  }
+
+  const kbuf = { text: '' };
+  function handleKeydown(e) {
+    const activeTarget = state.detachedTabId ? state.detachedDisplay : (state.workspaceForked ? state.forkDisplay : null);
+    if (!activeTarget) return;
+    if (!state.capToken) { toast('Sign in to type'); return; }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const cmd = kbuf.text.trim();
+      kbuf.text = '';
+      if (!cmd) return;
+      fetch('/api/keyboard', { method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ key_text: cmd, target_display: activeTarget }) }).catch((err) => toast('keystroke failed: ' + err.message));
+      return;
+    }
+    if (e.key === 'Backspace') { e.preventDefault(); kbuf.text = kbuf.text.slice(0, -1); return; }
+    if (e.key === 'Escape') { kbuf.text = ''; return; }
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); kbuf.text += e.key; }
+  }
+
+  async function sendPointer(px, py, targetDisplay) {
+    if (!state.capToken) { toast('Subscribe to interact'); return; }
+    try {
+      const payload = { px, py, video_width: 1280, video_height: 720, current_speaker_ms: getSpeakerMs() };
+      if (targetDisplay) payload.target_display = targetDisplay;
+      const res = await fetch('/api/pointer', { method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(payload) });
+      if (res.status === 401) { await refreshAuthState(); toast('Session expired — please sign in again'); return; }
+      const data = await res.json();
+      if (data.hit_target === 'RESTRICTED') { toast(data.message || 'Restricted'); return; }
+      const prevFork = state.forkDisplay;
+      if (typeof data.speaker_playing === 'boolean') state.speakerPlaying = data.speaker_playing;
+      if (typeof data.workspace_forked === 'boolean') state.workspaceForked = data.workspace_forked;
+      if (data.fork_display && !state.detachedTabId) state.forkDisplay = data.fork_display;
+      applyWorkspaceState();
+      if (data.hit_target === 'WORKSPACE_SUBSCREEN' && data.fork_display && data.fork_display !== prevFork) connectSubscreenWS();
+    } catch (e) { toast('pointer failed: ' + e.message); }
+  }
+
+  async function spawnTab(component) {
+    if (!state.canPopout || !state.capToken) { toast('Pop-outs require a paid subscription'); return; }
+    try {
+      const res = await fetch('/api/tabs/spawn', { method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ component_type: component, replay_from_ms: getSpeakerMs(), clone_live_fork_state: true }) });
+      if (res.status === 401) { await refreshAuthState(); toast('Session expired — please sign in again'); return; }
+      if (!res.ok) { const err = await res.json().catch(() => ({})); toast(err.detail || ('spawn failed ' + res.status)); return; }
+      const data = await res.json();
+      window.open(data.tab_url, '_blank', 'noopener');
+    } catch (e) { toast('spawn failed: ' + e.message); }
+  }
+
+  async function spawnTabWithModule(moduleId) {
+    if (!state.canPopout || !state.capToken) { toast('Pop-outs require a paid subscription'); return; }
+    try {
+      const res = await fetch('/api/tabs/spawn', { method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ component_type: 'FULL_WORKSPACE', replay_from_ms: getSpeakerMs(), clone_live_fork_state: true, module_id: moduleId }) });
+      if (res.status === 401) { await refreshAuthState(); toast('Session expired — please sign in again'); return; }
+      if (!res.ok) { const err = await res.json().catch(() => ({})); toast(err.detail || ('spawn failed ' + res.status)); return; }
+      const data = await res.json();
+      window.open(data.tab_url, '_blank', 'noopener');
+    } catch (e) { toast('spawn failed: ' + e.message); }
+  }
+
+  async function connectSSE() {
+    if (state.sseConn) { try { state.sseConn.close(); } catch (_) {} state.sseConn = null; }
+    let url = '/api/ledger/stream';
+    if (state.capToken) {
+      try { const ticket = await fetchOneTimeTicket(); url += '?ticket=' + encodeURIComponent(ticket); }
+      catch (e) { console.warn('[v2e] SSE ticket exchange failed', e); }
+    }
+    const es = new EventSource(url);
+    state.sseConn = es;
+    es.onopen = () => { state.sseRetryCount = 0; };
+    es.onmessage = (ev) => {
+      state.sseRetryCount = 0;
+      if (!ev.data || ev.data[0] === ':') return;
+      let d; try { d = JSON.parse(ev.data); } catch (_) { return; }
+      const manifestChanged = d.manifest && JSON.stringify(d.manifest) !== JSON.stringify(state.manifest);
+      if (d.manifest) state.manifest = d.manifest;
+      if (Array.isArray(d.linked_modules)) { state.linkedModules = d.linked_modules; applyLedger(); }
+      if (Array.isArray(d.active_tabs)) state.activeTabs = d.active_tabs;
+      if (typeof d.workspace_forked === 'boolean') state.workspaceForked = d.workspace_forked;
+      if (typeof d.speaker_playing === 'boolean') state.speakerPlaying = d.speaker_playing;
+      if (d.fork_display !== undefined) state.forkDisplay = d.fork_display;
+      applyWorkspaceState();
+      if (manifestChanged) refreshAuthState();
+    };
+    es.onerror = () => {
+      try { es.close(); } catch (_) {}
+      state.sseConn = null;
+      if (!document.hidden && state.bootstrapped) {
+        const delay = Math.min(30000, 1000 * Math.pow(2, state.sseRetryCount));
+        state.sseRetryCount = Math.min(state.sseRetryCount + 1, 6);
+        setTimeout(() => connectSSE(), delay);
+      }
+    };
+  }
+
+  async function refreshAuthState() {
+    try {
+      const res = await fetch('/api/ledger', { headers: apiHeaders({}) });
+      if (!res.ok) return;
+      const data = await res.json();
+      state.capToken = data.capability_token || null;
+      state.subscriber = data.subscriber || null;
+      if (Array.isArray(data.linked_modules)) { state.linkedModules = data.linked_modules; applyLedger(); }
+      state.canPopout = !!data.can_popout;
+      if (!state.detachedTabId) syncCapTokenStorage();
+      applyPopoutState();
+      applySubscriberBadge();
+    } catch (_) {}
+  }
+
+  async function connectSubscreenWS() {
+    if (!state.capToken) { if (state.detachedTabId) toast('Session expired — please sign in again on the main tab', 5000); return; }
+    let target = null;
+    if (state.detachedTabId) target = state.detachedDisplay || state.forkDisplay || null;
+    else if (state.workspaceForked && state.forkDisplay) target = state.forkDisplay;
+    else return;
+
+    let ticket;
+    try { ticket = await fetchOneTimeTicket(); } catch (e) { console.warn('[v2e] ws-ticket failed', e); return; }
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const qs = new URLSearchParams({ ticket });
+    if (target) qs.set('display', target);
+    const url = proto + '//' + location.host + '/ws/subscreen?' + qs;
+
+    if (state.wsConn) { try { state.wsConn.close(); } catch (_) {} }
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    state.wsConn = ws;
+
+    const wsCanvas = $('wsCanvas');
+    const ctx = wsCanvas ? wsCanvas.getContext('2d') : null;
+
+    ws.onopen = () => { if (wsCanvas) { wsCanvas.width = 1024; wsCanvas.height = 768; } };
+    ws.onmessage = async (ev) => {
+      if (!ctx || !ev.data) return;
+      try { const blob = new Blob([ev.data], { type: 'image/jpeg' }); const bmp = await createImageBitmap(blob); ctx.drawImage(bmp, 0, 0, wsCanvas.width, wsCanvas.height); if (bmp.close) bmp.close(); } catch (_) {}
+      try { ws.send('ack'); } catch (_) {}
+    };
+    ws.onerror = () => {};
+    ws.onclose = (ev) => {
+      state.wsConn = null;
+      if (ev && ev.code === 1008) { toast('Subscreen access denied'); return; }
+      if (!document.hidden && state.bootstrapped && (state.detachedTabId || state.workspaceForked)) setTimeout(() => connectSubscreenWS(), 2000);
+    };
+  }
+
+  window.addEventListener('pagehide', (event) => {
+    if (event.persisted) return;
+    if (!state.detachedTabId || !state.capToken) return;
+    const url = '/api/tabs/' + encodeURIComponent(state.detachedTabId) + '/close?requested_by=beacon&token=' + encodeURIComponent(state.capToken);
+    try { navigator.sendBeacon(url); } catch (_) {}
+  });
+
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!state.bootstrapped) return;
+    await refreshAuthState();
+    if (!state.wsConn || state.wsConn.readyState > 1) connectSubscreenWS();
+    if (!state.sseConn || state.sseConn.readyState === 2) { state.sseRetryCount = 0; connectSSE(); }
+  });
+
+  function setupBroadcastChannel() {
+    if (typeof BroadcastChannel === 'undefined') return;
+    if (!state.detachedTabId) {
+      const bc = new BroadcastChannel('v2e_speaker');
+      setInterval(() => { try { bc.postMessage({ speakerMs: getSpeakerMs(), ts: Date.now() }); } catch (_) {} }, 500);
+    } else {
+      const bc = new BroadcastChannel('v2e_speaker');
+      bc.onmessage = (ev) => { if (ev.data && typeof ev.data.speakerMs === 'number') state.lastSpeakerMs = ev.data.speakerMs; };
+    }
+  }
+
+  bootstrap();
+})();
+</script>
+</body>
+</html>
