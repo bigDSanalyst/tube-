@@ -1,0 +1,1955 @@
+The complete, consolidated app.py and static/index.html below integrate per-display UID/GID isolation (10000 + disp_num), xauth cookie enforcement (Xvfb -auth replacing -ac), stale mss handle eviction, ticket-authenticated SSE, detached-tab pointer routing, and the /api/tabs/{tab_id}/touch revival endpoint.
+Note: Ensure xauth is installed in your Dockerfile (apt-get install -y ... xauth) and docker-compose.yml includes cap_drop: [ALL] with cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE, KILL].
+### 1. app.py
+```python
+import asyncio
+import base64
+import difflib
+import heapq
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+import cv2
+import jwt
+import mss
+import numpy as np
+import pytesseract
+from cachetools import TTLCache
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from jwt import PyJWTError
+from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+VIDEO_PATH = "/app/videos/demo.mp4"
+LEDGER_CACHE_PATH = "/app/videos/demo.mp4.ledger.json"
+DISPLAY_REGEX = re.compile(r"^:(99|[1-9]\d{2,3})$")
+USER_FORK_BASE = 1100            # per-user fork displays :1100 - :1199
+USER_FORK_MAX = 1199
+TRUNK_UID = 65534                # nobody (shared trunk :99)
+
+_capture_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="x11_shm")
+_ocr_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")
+_tls = threading.local()          # thread-local mss handle cache
+
+TIER_RANK = {"free": 0, "paid": 1, "premium": 2}
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+@dataclass
+class PublisherManifest:
+    video_id: str
+    publisher_id: str
+    signed_at: int
+    min_subscriber_tier: str = "paid"
+    max_concurrent_tabs: int = 6
+    max_tabs_per_subscriber: int = 2
+    max_concurrent_forks: int = 50
+    allow_subscreen_fork: bool = True
+    allow_multi_tab_popout: bool = True
+    allowed_components: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.allowed_components is None:
+            self.allowed_components = [
+                "FULL_WORKSPACE",
+                "IDE_EDITOR",
+                "TERMINAL",
+                "VIEWPORT_PREVIEW",
+            ]
+
+
+@dataclass
+class SubscriberClaims:
+    user_id: str
+    publisher_id: str
+    tier: str
+    scope: List[str]
+    exp: int
+
+
+@dataclass
+class CapabilityToken:
+    token: str
+    user_id: str
+    tier: str
+    issued_at: float
+
+
+@dataclass
+class SubComponentROI:
+    component_id: str
+    label: str
+    bbox: Tuple[int, int, int, int]
+    target_win_geom: Tuple[int, int, int, int]
+
+
+@dataclass
+class SyncLedgerNode:
+    node_id: int
+    timestamp_ms: int
+    frame_idx: int
+    spoken_text: str
+    pixel_ocr_lines: List[str]
+    inferred_cmd: str
+
+
+@dataclass
+class UserWorkspace:
+    user_id: str
+    tier: str = "free"
+    speaker_playing: bool = True
+    workspace_forked: bool = False
+    forked_at_ms: int = 0
+    user_cmd_history: List[str] = field(default_factory=list)
+    fork_display: Optional[str] = None
+    fork_tmux_socket: Optional[str] = None
+    fork_xauth_path: Optional[str] = None
+    fork_home_dir: Optional[str] = None
+    fork_xvfb_proc: Optional[subprocess.Popen] = None
+    fork_wm_proc: Optional[subprocess.Popen] = None
+    fork_app_proc: Optional[subprocess.Popen] = None
+    last_touched: float = 0.0
+
+
+@dataclass
+class SpawnedTabSession:
+    tab_id: str
+    owner_user_id: str
+    display_num: int
+    display_str: str
+    tmux_socket: str
+    xauth_path: str
+    home_dir: str
+    component_type: str
+    replay_from_ms: int
+    cloned_scrollback_lines: int
+    created_at: float
+    last_touched: float
+    xvfb_proc: Optional[subprocess.Popen] = None
+    wm_proc: Optional[subprocess.Popen] = None
+    app_proc: Optional[subprocess.Popen] = None
+
+
+# ---------------------------------------------------------------------------
+# Request bodies
+# ---------------------------------------------------------------------------
+class PointerEventRequest(BaseModel):
+    px: int
+    py: int
+    video_width: int = Field(default=1280, ge=1)
+    video_height: int = Field(default=720, ge=1)
+    current_speaker_ms: int = Field(default=0, ge=0)
+    target_display: Optional[str] = None
+
+
+class KeyEventRequest(BaseModel):
+    key_text: str = Field(..., max_length=512)
+    target_display: Optional[str] = None
+
+
+class ResyncRequest(BaseModel):
+    direction: str
+    speaker_ms: int = Field(default=0, ge=0)
+    user_terminal_text: Optional[str] = ""
+    target_display: Optional[str] = None
+
+
+class SpawnTabRequest(BaseModel):
+    component_type: str = "FULL_WORKSPACE"
+    replay_from_ms: int = Field(default=0, ge=0)
+    clone_live_fork_state: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+class HardenedBitemporalEngine:
+    def __init__(self):
+        self.display_trunk = ":99"
+        self.sandbox_w = 1024
+        self.sandbox_h = 768
+
+        self.manifest: Optional[PublisherManifest] = None
+        self.speaker_roi = (980, 480, 260, 200)
+        self.workspace_roi = (40, 40, 920, 600)
+
+        self.sub_components: Dict[str, SubComponentROI] = {
+            "FULL_WORKSPACE":   SubComponentROI("FULL_WORKSPACE", "Full Subscreen", (40, 40, 920, 600), (0, 0, 1024, 768)),
+            "IDE_EDITOR":       SubComponentROI("IDE_EDITOR", "Code Editor",     (40, 40, 600, 400), (0, 0, 1024, 620)),
+            "TERMINAL":         SubComponentROI("TERMINAL", "Bash Terminal",     (40, 450, 920, 190), (0, 120, 1024, 648)),
+            "VIEWPORT_PREVIEW": SubComponentROI("VIEWPORT_PREVIEW", "Live Output", (650, 40, 310, 400), (64, 32, 896, 704)),
+        }
+
+        self.ledger: List[SyncLedgerNode] = []
+
+        self.tab_lock = asyncio.Lock()
+        self.workspace_lock = asyncio.Lock()
+        self.active_tabs: Dict[str, SpawnedTabSession] = {}
+        self.workspaces: Dict[str, UserWorkspace] = {}
+        self.display_xauth: Dict[str, str] = {}
+        self.free_display_heap: List[int] = []
+        self.next_display_num: int = 101
+        self.user_fork_displays_in_use: Set[int] = set()
+        self.tab_ttl_seconds: float = 900.0
+        self.workspace_ttl_seconds: float = 1800.0
+
+        self.valid_cap_tokens: TTLCache = TTLCache(maxsize=10_000, ttl=3600)
+        self.ws_tickets: TTLCache = TTLCache(maxsize=4_000, ttl=60)
+
+        # SSE: dict[asyncio.Queue, Optional[str]] (queue -> user_id)
+        self.sse_subscribers: Dict[asyncio.Queue, Optional[str]] = {}
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    # --- tokens ------------------------------------------------------------
+    def issue_capability_token(self, claims: SubscriberClaims) -> str:
+        token = secrets.token_urlsafe(32)
+        self.valid_cap_tokens[token] = CapabilityToken(
+            token=token, user_id=claims.user_id,
+            tier=claims.tier, issued_at=time.time(),
+        )
+        return token
+
+    def resolve_cap_token(self, token: Optional[str]) -> CapabilityToken:
+        if not token or token not in self.valid_cap_tokens:
+            raise HTTPException(401, "Invalid or expired capability token")
+        return self.valid_cap_tokens[token]
+
+    def issue_ws_ticket(self, user_id: Optional[str]) -> str:
+        ticket = secrets.token_urlsafe(32)
+        self.ws_tickets[ticket] = {"user_id": user_id}
+        return ticket
+
+    # --- validation & ownership --------------------------------------------
+    def validate_display(self, display: Optional[str]) -> str:
+        target = display or self.display_trunk
+        if not DISPLAY_REGEX.fullmatch(target):
+            raise HTTPException(400, f"Invalid X11 display: {target}")
+        return target
+
+    def _assert_display_ownership(self, disp: str, user_id: Optional[str]) -> None:
+        if disp == self.display_trunk:
+            return
+        for tab in self.active_tabs.values():
+            if tab.display_str == disp:
+                if user_id is None or tab.owner_user_id != user_id:
+                    raise HTTPException(403, "Sandbox belongs to another subscriber")
+                return
+        for ws in self.workspaces.values():
+            if ws.fork_display == disp:
+                if user_id is None or ws.user_id != user_id:
+                    raise HTTPException(403, "Fork belongs to another subscriber")
+                return
+        raise HTTPException(404, "No active sandbox on this display")
+
+    # --- SSE ---------------------------------------------------------------
+    def notify_sse_subscribers(self):
+        if not self.manifest or not self._main_loop or not self._main_loop.is_running():
+            return
+        manifest_dict = asdict(self.manifest)
+
+        def _deliver():
+            for q, user_id in list(self.sse_subscribers.items()):
+                user_tabs = [
+                    {
+                        "tab_id": t.tab_id,
+                        "component_type": t.component_type,
+                        "display_str": t.display_str,
+                        "cloned_scrollback_lines": t.cloned_scrollback_lines,
+                    }
+                    for t in self.active_tabs.values()
+                    if user_id is not None and t.owner_user_id == user_id
+                ]
+                ws_obj = self.workspaces.get(user_id) if user_id else None
+                payload = json.dumps({
+                    "manifest": manifest_dict,
+                    "active_tabs": user_tabs,
+                    "workspace_forked": bool(ws_obj and ws_obj.workspace_forked),
+                    "speaker_playing": bool(ws_obj.speaker_playing) if ws_obj else True,
+                    "fork_display": ws_obj.fork_display if ws_obj else None,
+                })
+                try:
+                    q.put_nowait(payload)
+                except asyncio.QueueFull:
+                    pass
+
+        self._main_loop.call_soon_threadsafe(_deliver)
+
+    # --- transcript --------------------------------------------------------
+    def load_or_build_transcript(self, video_path: str) -> List[SyncLedgerNode]:
+        if os.path.exists(LEDGER_CACHE_PATH):
+            try:
+                with open(LEDGER_CACHE_PATH, "r", encoding="utf-8") as f:
+                    self.ledger = [SyncLedgerNode(**item) for item in json.load(f)]
+                return self.ledger
+            except Exception:
+                pass
+        if not os.path.exists(video_path):
+            return []
+
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        prev_gray, nodes, frame_idx, node_counter = None, [], 0, 0
+        synthetic = [
+            ("Initializing workspace environment and listing files", "echo 'Init Workspace' && ls -la"),
+            ("Checking Python runtime version and active processes", "python3 --version && ps aux"),
+            ("Compiling module and verifying build artifacts", "echo 'Build Passed [OK]' && date"),
+            ("Running test suite inside isolated container", "uname -a && uptime"),
+        ]
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % 15 == 0:
+                ts_ms = int((frame_idx / fps) * 1000.0)
+                wx, wy, ww, wh = self.workspace_roi
+                gray = cv2.cvtColor(frame[wy:wy + wh, wx:wx + ww], cv2.COLOR_BGR2GRAY)
+                ocr_lines: List[str] = []
+                if prev_gray is None or np.mean(cv2.absdiff(gray, prev_gray)) > 2.0:
+                    prev_gray = gray
+                    try:
+                        raw = pytesseract.image_to_string(gray).strip()
+                        ocr_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                    except Exception:
+                        ocr_lines = []
+                spoken, cmd = synthetic[node_counter % len(synthetic)]
+                if not ocr_lines:
+                    ocr_lines = [cmd, f"frame_{frame_idx}_state"]
+                nodes.append(SyncLedgerNode(
+                    node_id=node_counter, timestamp_ms=ts_ms, frame_idx=frame_idx,
+                    spoken_text=spoken, pixel_ocr_lines=ocr_lines, inferred_cmd=cmd,
+                ))
+                node_counter += 1
+            frame_idx += 1
+        cap.release()
+        self.ledger = nodes
+        try:
+            with open(LEDGER_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump([asdict(n) for n in nodes], f)
+        except Exception:
+            pass
+        return nodes
+
+    # --- Per-display UID + Xauthority sandboxing ---------------------------
+    @staticmethod
+    def _sandbox_ids(disp_num: int) -> Tuple[int, int]:
+        uid = 10000 + disp_num
+        return uid, uid
+
+    def _sandbox_user_kwargs(self, disp_num: int) -> dict:
+        uid, gid = self._sandbox_ids(disp_num)
+        return {"user": uid, "group": gid, "extra_groups": []}
+
+    def _prepare_sandbox_dir(self, disp_num: int) -> Tuple[str, str, str]:
+        """Creates a 0700 per-display home dir, tmux socket path, and 0600 .Xauthority cookie."""
+        uid, gid = self._sandbox_ids(disp_num)
+        home = f"/tmp/v2e_sandbox_{disp_num}"
+        shutil.rmtree(home, ignore_errors=True)
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        os.chown(home, uid, gid)
+
+        socket_path = os.path.join(home, "tmux.sock")
+        xauth_path = os.path.join(home, ".Xauthority")
+        cookie = secrets.token_hex(16)
+        subprocess.run(
+            ["xauth", "-f", xauth_path, "add", f":{disp_num}", ".", cookie],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(xauth_path):
+            os.chmod(xauth_path, 0o600)
+            os.chown(xauth_path, uid, gid)
+
+        self.display_xauth[f":{disp_num}"] = xauth_path
+        return home, socket_path, xauth_path
+
+    def _sandbox_env(self, display: str, home: str, xauth_path: str) -> dict:
+        allow = {"LANG"}
+        base = {k: os.environ[k] for k in allow if k in os.environ}
+        base.update({
+            "DISPLAY": display,
+            "HOME": home,
+            "XAUTHORITY": xauth_path,
+            "USER": "sandbox",
+            "TERM": "xterm-256color",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "TMPDIR": home,
+        })
+        return base
+
+    def _run_x11_argv(self, display: str, argv: List[str]) -> str:
+        disp = self.validate_display(display)
+        env = {"DISPLAY": disp, "PATH": "/usr/bin:/bin:/usr/local/bin"}
+        xauth = self.display_xauth.get(disp)
+        if xauth:
+            env["XAUTHORITY"] = xauth
+        res = subprocess.run(
+            argv, env=env, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        return res.stdout.strip()
+
+    def _capture_tmux_scrollback(self, socket_path: str, disp_num: Optional[int] = None) -> str:
+        kwargs = self._sandbox_user_kwargs(disp_num) if disp_num is not None else {
+            "user": TRUNK_UID, "group": TRUNK_UID, "extra_groups": []
+        }
+        res = subprocess.run(
+            ["tmux", "-S", socket_path, "capture-pane", "-p", "-S", "-120"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            **kwargs,
+        )
+        return res.stdout if res.returncode == 0 else ""
+
+    # --- user workspace ----------------------------------------------------
+    def _get_workspace(self, user_id: str, tier: str = "free") -> UserWorkspace:
+        ws = self.workspaces.get(user_id)
+        if not ws:
+            ws = UserWorkspace(user_id=user_id, tier=tier)
+            self.workspaces[user_id] = ws
+        ws.last_touched = time.time()
+        return ws
+
+    async def _ensure_user_fork(self, cap: CapabilityToken, fork_ms: int) -> UserWorkspace:
+        async with self.workspace_lock:
+            ws = self.workspaces.get(cap.user_id)
+            if ws and ws.fork_display:
+                ws.last_touched = time.time()
+                return ws
+
+            active_forks = sum(1 for w in self.workspaces.values() if w.fork_display)
+            if active_forks >= (self.manifest.max_concurrent_forks or 50):
+                raise HTTPException(503, "User fork pool exhausted — try again shortly")
+
+            disp_num = USER_FORK_BASE
+            while disp_num in self.user_fork_displays_in_use and disp_num <= USER_FORK_MAX:
+                disp_num += 1
+            if disp_num > USER_FORK_MAX:
+                raise HTTPException(503, "User fork display range exhausted")
+            self.user_fork_displays_in_use.add(disp_num)
+            disp_str = f":{disp_num}"
+
+            home, socket_path, xauth_path = self._prepare_sandbox_dir(disp_num)
+            env = self._sandbox_env(disp_str, home, xauth_path)
+            user_kw = self._sandbox_user_kwargs(disp_num)
+
+            xvfb = subprocess.Popen(
+                [
+                    "Xvfb", disp_str, "-screen", "0",
+                    f"{self.sandbox_w}x{self.sandbox_h}x24",
+                    "-auth", xauth_path, "+extension", "GLX", "-noreset",
+                ],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            await asyncio.sleep(0.25)
+            wm = subprocess.Popen(
+                ["openbox"],
+                env={"DISPLAY": disp_str, "XAUTHORITY": xauth_path, "HOME": home, "PATH": "/usr/bin:/bin"},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **user_kw,
+            )
+            await asyncio.sleep(0.15)
+
+            subprocess.run(
+                ["tmux", "-S", socket_path, "new-session", "-d", "-s", "main", "-x", "120", "-y", "36"],
+                env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **user_kw,
+            )
+
+            trunk_socket = f"/tmp/tmux-{TRUNK_UID}/v2e_trunk"
+            captured = self._capture_tmux_scrollback(trunk_socket, disp_num=None)
+            scrollback_lines = [ln for ln in captured.splitlines() if ln.strip()]
+
+            replay_cmd = "echo 'Workspace Ready'"
+            for node in self.ledger:
+                if node.timestamp_ms <= fork_ms:
+                    replay_cmd = node.inferred_cmd
+                else:
+                    break
+
+            def send(text: str):
+                subprocess.run(
+                    ["tmux", "-S", socket_path, "send-keys", "-t", "main", "-l", text],
+                    env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **user_kw,
+                )
+                subprocess.run(
+                    ["tmux", "-S", socket_path, "send-keys", "-t", "main", "Enter"],
+                    env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **user_kw,
+                )
+
+            send(f"# === FORK {disp_str} @ {fork_ms}ms — {len(scrollback_lines)} lines cloned ===")
+            send(replay_cmd)
+
+            win_title = f"V2E_FORK_{disp_num}"
+            app = subprocess.Popen(
+                [
+                    "xterm", "-geometry", "120x36+0+0", "-bg", "#0b0f17", "-fg", "#3fb950",
+                    "-T", win_title,
+                    "-e", "tmux", "-S", socket_path, "attach-session", "-t", "main",
+                ],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **user_kw,
+            )
+            await asyncio.sleep(0.2)
+
+            win_ids = self._run_x11_argv(disp_str, ["xdotool", "search", "--name", win_title]).splitlines()
+            if win_ids:
+                wid = win_ids[0].strip()
+                self._run_x11_argv(disp_str, ["xdotool", "windowmove", wid, "0", "0"])
+                self._run_x11_argv(disp_str, ["xdotool", "windowsize", wid, "1024", "768"])
+
+            ws = self.workspaces.get(cap.user_id) or UserWorkspace(user_id=cap.user_id, tier=cap.tier)
+            ws.tier = cap.tier
+            ws.fork_display = disp_str
+            ws.fork_tmux_socket = socket_path
+            ws.fork_xauth_path = xauth_path
+            ws.fork_home_dir = home
+            ws.fork_xvfb_proc = xvfb
+            ws.fork_wm_proc = wm
+            ws.fork_app_proc = app
+            ws.workspace_forked = True
+            ws.forked_at_ms = fork_ms
+            ws.last_touched = time.time()
+            self.workspaces[cap.user_id] = ws
+            self.notify_sse_subscribers()
+            return ws
+
+    # --- tab spawn ---------------------------------------------------------
+    async def spawn_detached_tab_sandbox(self, req: SpawnTabRequest, cap: CapabilityToken) -> SpawnedTabSession:
+        async with self.tab_lock:
+            if TIER_RANK[cap.tier] < TIER_RANK[self.manifest.min_subscriber_tier]:
+                raise HTTPException(403, f"Requires tier '{self.manifest.min_subscriber_tier}' or higher")
+            if not self.manifest.allow_subscreen_fork or not self.manifest.allow_multi_tab_popout:
+                raise HTTPException(403, "Publisher has disabled pop-out tabs")
+            user_tabs = sum(1 for t in self.active_tabs.values() if t.owner_user_id == cap.user_id)
+            if user_tabs >= self.manifest.max_tabs_per_subscriber:
+                raise HTTPException(429, f"Per-subscriber tab limit ({self.manifest.max_tabs_per_subscriber}) reached")
+            if len(self.active_tabs) >= self.manifest.max_concurrent_tabs:
+                raise HTTPException(429, "Global tab pool exhausted")
+            if req.component_type not in (self.manifest.allowed_components or []):
+                raise HTTPException(403, f"Component '{req.component_type}' restricted")
+
+            if self.free_display_heap:
+                disp_num = heapq.heappop(self.free_display_heap)
+            else:
+                disp_num = self.next_display_num
+                self.next_display_num += 1
+
+            disp_str = f":{disp_num}"
+            tab_id = f"tab_{disp_num}_{uuid.uuid4().hex[:6]}"
+            home, socket_path, xauth_path = self._prepare_sandbox_dir(disp_num)
+            env = self._sandbox_env(disp_str, home, xauth_path)
+            user_kw = self._sandbox_user_kwargs(disp_num)
+
+            xvfb = subprocess.Popen(
+                [
+                    "Xvfb", disp_str, "-screen", "0",
+                    f"{self.sandbox_w}x{self.sandbox_h}x24",
+                    "-auth", xauth_path, "+extension", "GLX", "-noreset",
+                ],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            await asyncio.sleep(0.25)
+            wm = subprocess.Popen(
+                ["openbox"],
+                env={"DISPLAY": disp_str, "XAUTHORITY": xauth_path, "HOME": home, "PATH": "/usr/bin:/bin"},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **user_kw,
+            )
+            await asyncio.sleep(0.15)
+
+            subprocess.run(
+                ["tmux", "-S", socket_path, "new-session", "-d", "-s", "main", "-x", "120", "-y", "36"],
+                env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **user_kw,
+            )
+
+            source_socket = None
+            source_disp_num = None
+            if req.clone_live_fork_state and cap.user_id:
+                user_ws = self.workspaces.get(cap.user_id)
+                if user_ws and user_ws.fork_tmux_socket and user_ws.fork_display:
+                    source_socket = user_ws.fork_tmux_socket
+                    source_disp_num = int(user_ws.fork_display.split(":")[1])
+            if not source_socket:
+                source_socket = f"/tmp/tmux-{TRUNK_UID}/v2e_trunk"
+
+            captured = self._capture_tmux_scrollback(source_socket, disp_num=source_disp_num)
+            scrollback_lines = [ln for ln in captured.splitlines() if ln.strip()]
+
+            replay_cmd = "echo 'Workspace Ready'"
+            for node in self.ledger:
+                if node.timestamp_ms <= req.replay_from_ms:
+                    replay_cmd = node.inferred_cmd
+                else:
+                    break
+
+            def send(text: str):
+                subprocess.run(
+                    ["tmux", "-S", socket_path, "send-keys", "-t", "main", "-l", text],
+                    env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **user_kw,
+                )
+                subprocess.run(
+                    ["tmux", "-S", socket_path, "send-keys", "-t", "main", "Enter"],
+                    env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **user_kw,
+                )
+
+            send(f"# === CLONED {req.component_type} ({disp_str}) @ {req.replay_from_ms}ms ===")
+            if scrollback_lines:
+                send(f"# Prior state: {len(scrollback_lines)} lines")
+            send(replay_cmd)
+
+            fg = {
+                "IDE_EDITOR": "#58a6ff",
+                "VIEWPORT_PREVIEW": "#f59e0b",
+            }.get(req.component_type, "#3fb950")
+            win_title = f"V2E_{tab_id}"
+            app = subprocess.Popen(
+                [
+                    "xterm", "-geometry", "120x36+0+0", "-bg", "#0b0f17", "-fg", fg,
+                    "-T", win_title,
+                    "-e", "tmux", "-S", socket_path, "attach-session", "-t", "main",
+                ],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **user_kw,
+            )
+            await asyncio.sleep(0.2)
+
+            roi = self.sub_components.get(req.component_type, self.sub_components["FULL_WORKSPACE"])
+            wx, wy, ww, wh = roi.target_win_geom
+            win_ids = self._run_x11_argv(disp_str, ["xdotool", "search", "--name", win_title]).splitlines()
+            if win_ids:
+                wid = win_ids[0].strip()
+                self._run_x11_argv(disp_str, ["xdotool", "windowmove", wid, str(wx), str(wy)])
+                self._run_x11_argv(disp_str, ["xdotool", "windowsize", wid, str(ww), str(wh)])
+
+            now = time.time()
+            session = SpawnedTabSession(
+                tab_id=tab_id, owner_user_id=cap.user_id, display_num=disp_num,
+                display_str=disp_str, tmux_socket=socket_path,
+                xauth_path=xauth_path, home_dir=home,
+                component_type=req.component_type, replay_from_ms=req.replay_from_ms,
+                cloned_scrollback_lines=len(scrollback_lines),
+                created_at=now, last_touched=now,
+                xvfb_proc=xvfb, wm_proc=wm, app_proc=app,
+            )
+            self.active_tabs[tab_id] = session
+            self.notify_sse_subscribers()
+            return session
+
+    # --- teardown ----------------------------------------------------------
+    async def _terminate_proc(self, proc: Optional[subprocess.Popen], timeout: float = 3.0):
+        if proc is None:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            proc.terminate()
+            await loop.run_in_executor(None, lambda: proc.wait(timeout=timeout))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            await loop.run_in_executor(None, proc.wait)
+        except ProcessLookupError:
+            pass
+
+    async def close_and_reap_tab(
+        self,
+        tab_id: str,
+        requested_by: Optional[str] = None,
+        requesting_user: Optional[str] = None,
+        grace_seconds: float = 2.0,
+    ) -> Dict[str, object]:
+        if requested_by == "beacon" and grace_seconds > 0:
+            await asyncio.sleep(grace_seconds)
+            s = self.active_tabs.get(tab_id)
+            if s and (time.time() - s.last_touched) < grace_seconds:
+                return {"status": "REVIVED", "tab_id": tab_id}
+
+        async with self.tab_lock:
+            session = self.active_tabs.get(tab_id)
+            if not session:
+                raise HTTPException(404, "Tab not found or already closed")
+            if requesting_user is not None and session.owner_user_id != requesting_user:
+                raise HTTPException(403, "Cannot close another subscriber's tab")
+            self.active_tabs.pop(tab_id, None)
+
+            user_kw = self._sandbox_user_kwargs(session.display_num)
+            await self._terminate_proc(session.app_proc)
+            subprocess.run(
+                ["tmux", "-S", session.tmux_socket, "kill-server"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **user_kw,
+            )
+            await self._terminate_proc(session.wm_proc)
+            await self._terminate_proc(session.xvfb_proc)
+
+            self.display_xauth.pop(session.display_str, None)
+            shutil.rmtree(session.home_dir, ignore_errors=True)
+            heapq.heappush(self.free_display_heap, session.display_num)
+            self.notify_sse_subscribers()
+            return {"status": "REAPED", "tab_id": tab_id, "recycled_display": session.display_str}
+
+    async def _reap_workspace(self, user_id: str):
+        async with self.workspace_lock:
+            ws = self.workspaces.get(user_id)
+            if not ws or not ws.fork_display:
+                return
+            disp_num = int(ws.fork_display.split(":")[1])
+            user_kw = self._sandbox_user_kwargs(disp_num)
+
+            await self._terminate_proc(ws.fork_app_proc)
+            if ws.fork_tmux_socket:
+                subprocess.run(
+                    ["tmux", "-S", ws.fork_tmux_socket, "kill-server"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **user_kw,
+                )
+            await self._terminate_proc(ws.fork_wm_proc)
+            await self._terminate_proc(ws.fork_xvfb_proc)
+
+            self.display_xauth.pop(ws.fork_display, None)
+            if ws.fork_home_dir:
+                shutil.rmtree(ws.fork_home_dir, ignore_errors=True)
+            self.user_fork_displays_in_use.discard(disp_num)
+            ws.fork_display = None
+            ws.fork_tmux_socket = None
+            ws.fork_xauth_path = None
+            ws.fork_home_dir = None
+            ws.fork_xvfb_proc = ws.fork_wm_proc = ws.fork_app_proc = None
+            ws.workspace_forked = False
+            self.notify_sse_subscribers()
+
+    async def reap_expired_loop(self):
+        while True:
+            await asyncio.sleep(30.0)
+            now = time.time()
+            for tid, s in list(self.active_tabs.items()):
+                if (now - s.last_touched) > self.tab_ttl_seconds:
+                    try:
+                        await self.close_and_reap_tab(tid, grace_seconds=0)
+                    except Exception:
+                        pass
+            for uid, ws in list(self.workspaces.items()):
+                if ws.fork_display and (now - ws.last_touched) > self.workspace_ttl_seconds:
+                    try:
+                        await self._reap_workspace(uid)
+                    except Exception:
+                        pass
+
+    # --- capture (with XAUTHORITY + stale mss eviction) --------------------
+    def capture_x11_shm_jpeg(self, display: str) -> bytes:
+        disp = self.validate_display(display)
+        xauth = self.display_xauth.get(disp)
+        if xauth:
+            os.environ["XAUTHORITY"] = xauth
+        else:
+            os.environ.pop("XAUTHORITY", None)
+
+        cache = getattr(_tls, "mss_cache", None)
+        if cache is None:
+            cache = {}
+            _tls.mss_cache = cache
+
+        # Track (sct, xauth_path) so recycled displays with a new .Xauthority force a fresh connection
+        entry = cache.get(disp)
+        if entry is None or entry[1] != xauth:
+            if entry is not None:
+                try:
+                    entry[0].close()
+                except Exception:
+                    pass
+            try:
+                cache[disp] = (mss.mss(display=disp), xauth)
+            except Exception:
+                cache.pop(disp, None)
+                return self._blank_jpeg(disp)
+
+        sct = cache[disp][0]
+        try:
+            sct_img = sct.grab(sct.monitors[1])
+            frame = np.frombuffer(sct_img.bgra, dtype=np.uint8).reshape(
+                sct_img.height, sct_img.width, 4
+            )
+            bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ok:
+                return buf.tobytes()
+        except Exception:
+            try:
+                sct.close()
+            except Exception:
+                pass
+            cache.pop(disp, None)
+        return self._blank_jpeg(disp)
+
+    def _blank_jpeg(self, disp: str) -> bytes:
+        blank = np.zeros((self.sandbox_h, self.sandbox_w, 3), dtype=np.uint8)
+        cv2.putText(
+            blank, f"Sandbox {disp} Active", (40, 80),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (56, 189, 248), 2,
+        )
+        _, buf = cv2.imencode(".jpg", blank)
+        return buf.tobytes()
+
+    # --- pointer (supports both main video ROI and detached tab direct) ----
+    async def route_pointer(self, req: PointerEventRequest, cap: CapabilityToken) -> Dict[str, object]:
+        ws = self._get_workspace(cap.user_id, cap.tier)
+
+        # Direct detached-tab click routing
+        if req.target_display:
+            disp = self.validate_display(req.target_display)
+            self._assert_display_ownership(disp, cap.user_id)
+            if disp == self.display_trunk:
+                raise HTTPException(403, "Cannot click directly into shared trunk")
+            local_x = int((req.px / float(max(req.video_width, 1))) * self.sandbox_w)
+            local_y = int((req.py / float(max(req.video_height, 1))) * self.sandbox_h)
+            self._run_x11_argv(disp, ["xdotool", "mousemove", str(local_x), str(local_y), "click", "1"])
+            for s in self.active_tabs.values():
+                if s.display_str == disp:
+                    s.last_touched = time.time()
+            return {
+                "hit_target": "DETACHED_TAB",
+                "speaker_playing": ws.speaker_playing,
+                "workspace_forked": ws.workspace_forked,
+                "fork_display": disp,
+                "sandbox_xy": [local_x, local_y],
+            }
+
+        # Main tab video-overlay ROI routing
+        sx = int(req.px * (1280.0 / max(req.video_width, 1)))
+        sy = int(req.py * (720.0 / max(req.video_height, 1)))
+        px, py, pw, ph = self.speaker_roi
+        wx, wy, ww, wh = self.workspace_roi
+
+        if px <= sx <= px + pw and py <= sy <= py + ph:
+            ws.speaker_playing = not ws.speaker_playing
+            return {
+                "hit_target": "SPEAKER_STREAM",
+                "speaker_playing": ws.speaker_playing,
+                "workspace_forked": ws.workspace_forked,
+            }
+
+        if wx <= sx <= wx + ww and wy <= sy <= wy + wh:
+            if TIER_RANK[cap.tier] < TIER_RANK[self.manifest.min_subscriber_tier]:
+                return {
+                    "hit_target": "RESTRICTED",
+                    "speaker_playing": ws.speaker_playing,
+                    "workspace_forked": ws.workspace_forked,
+                    "message": f"Requires tier '{self.manifest.min_subscriber_tier}'",
+                }
+            if not self.manifest.allow_subscreen_fork:
+                return {
+                    "hit_target": "RESTRICTED",
+                    "speaker_playing": ws.speaker_playing,
+                    "workspace_forked": ws.workspace_forked,
+                    "message": "Publisher disabled interactive forking",
+                }
+
+            ws = await self._ensure_user_fork(cap, req.current_speaker_ms)
+            local_x = int(((sx - wx) / float(ww)) * self.sandbox_w)
+            local_y = int(((sy - wy) / float(wh)) * self.sandbox_h)
+            self._run_x11_argv(ws.fork_display, ["xdotool", "mousemove", str(local_x), str(local_y), "click", "1"])
+            ws.last_touched = time.time()
+            return {
+                "hit_target": "WORKSPACE_SUBSCREEN",
+                "speaker_playing": ws.speaker_playing,
+                "workspace_forked": True,
+                "fork_display": ws.fork_display,
+                "sandbox_xy": [local_x, local_y],
+            }
+
+        return {
+            "hit_target": "BACKGROUND",
+            "speaker_playing": ws.speaker_playing,
+            "workspace_forked": ws.workspace_forked,
+        }
+
+    # --- keystrokes --------------------------------------------------------
+    def send_keystrokes(
+        self, text: str, cap: CapabilityToken, target_display: Optional[str] = None
+    ) -> Dict[str, object]:
+        disp = self.validate_display(target_display)
+        self._assert_display_ownership(disp, cap.user_id)
+
+        ws = self._get_workspace(cap.user_id, cap.tier)
+        if disp == self.display_trunk:
+            raise HTTPException(403, "Cannot type into the shared trunk")
+        if ws.fork_display == disp:
+            ws.workspace_forked = True
+        ws.user_cmd_history.append(text)
+        ws.last_touched = time.time()
+
+        for s in self.active_tabs.values():
+            if s.display_str == disp:
+                s.last_touched = time.time()
+
+        self._run_x11_argv(disp, ["xdotool", "type", "--delay", "10", "--", text])
+        self._run_x11_argv(disp, ["xdotool", "key", "Return"])
+        self.notify_sse_subscribers()
+        return {"status": "EXECUTED", "display": disp, "command": text}
+
+    # --- resync ------------------------------------------------------------
+    async def resync(self, req: ResyncRequest, cap: CapabilityToken) -> Dict[str, object]:
+        if not self.ledger:
+            self.load_or_build_transcript(VIDEO_PATH)
+
+        disp = self.validate_display(req.target_display)
+        self._assert_display_ownership(disp, cap.user_id)
+        ws = self._get_workspace(cap.user_id, cap.tier)
+
+        if req.direction == "SUBSCREEN_TO_SPEAKER":
+            target = self.ledger[0]
+            for node in self.ledger:
+                if node.timestamp_ms <= req.speaker_ms:
+                    target = node
+                else:
+                    break
+            if disp != self.display_trunk:
+                self._run_x11_argv(disp, ["xdotool", "type", "--delay", "8", "--", target.inferred_cmd])
+                self._run_x11_argv(disp, ["xdotool", "key", "Return"])
+            if ws.fork_display == disp:
+                ws.workspace_forked = False
+            ws.last_touched = time.time()
+            self.notify_sse_subscribers()
+            return {
+                "direction": "SUBSCREEN_TO_SPEAKER",
+                "synced_timestamp_ms": target.timestamp_ms,
+                "restored_command": target.inferred_cmd,
+                "workspace_forked": ws.workspace_forked,
+            }
+
+        query = (req.user_terminal_text or " ".join(ws.user_cmd_history[-2:])).strip()
+        best_node, best_score = self.ledger[0], -1.0
+        for node in self.ledger:
+            cand = " ".join(node.pixel_ocr_lines) + " " + node.inferred_cmd
+            s = difflib.SequenceMatcher(None, query.lower(), cand.lower()).ratio()
+            if s > best_score:
+                best_score, best_node = s, node
+        return {
+            "direction": "SPEAKER_TO_SUBSCREEN",
+            "seek_speaker_ms": best_node.timestamp_ms,
+            "matched_command": best_node.inferred_cmd,
+            "similarity": round(best_score, 3),
+        }
+
+
+engine = HardenedBitemporalEngine()
+PUBLISHER_MANIFEST_PUBKEY: Optional[Ed25519PublicKey] = None
+PUBLISHER_AUTH_PUBKEY: Optional[Ed25519PublicKey] = None
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+def load_ed25519_pubkey(env_var: str, required: bool) -> Optional[Ed25519PublicKey]:
+    val = os.environ.get(env_var)
+    if not val:
+        if required:
+            raise RuntimeError(f"FATAL: {env_var} is unset (V2E_REQUIRE_AUTH=1)")
+        return None
+    try:
+        pem = val.encode() if "BEGIN PUBLIC KEY" in val else base64.b64decode(val)
+        key = load_pem_public_key(pem)
+        if not isinstance(key, Ed25519PublicKey):
+            raise ValueError("not Ed25519")
+        print(f"[V2E-v6] loaded {env_var} OK")
+        return key
+    except Exception as e:
+        if required:
+            raise RuntimeError(f"FATAL: {env_var} invalid: {e}")
+        print(f"[V2E-v6] WARN: {env_var} invalid, ignoring: {e}")
+        return None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine._main_loop = asyncio.get_running_loop()
+    global PUBLISHER_MANIFEST_PUBKEY, PUBLISHER_AUTH_PUBKEY
+
+    require_auth = os.environ.get("V2E_REQUIRE_AUTH", "1") == "1"
+    PUBLISHER_MANIFEST_PUBKEY = load_ed25519_pubkey("PUBLISHER_MANIFEST_PUBKEY_PEM", require_auth)
+    PUBLISHER_AUTH_PUBKEY = load_ed25519_pubkey("PUBLISHER_AUTH_PUBKEY_PEM", require_auth)
+
+    manifest_file = Path("/app/manifests/demo_manifest.json")
+    sig_file = Path("/app/manifests/demo_manifest.sig")
+
+    if manifest_file.exists() and sig_file.exists() and PUBLISHER_MANIFEST_PUBKEY:
+        try:
+            body = manifest_file.read_bytes()
+            sig = sig_file.read_bytes()
+            PUBLISHER_MANIFEST_PUBKEY.verify(sig, body)
+            engine.manifest = PublisherManifest(**json.loads(body))
+            print(f"[V2E-v6] verified manifest for video={engine.manifest.video_id}")
+        except (InvalidSignature, Exception) as e:
+            raise RuntimeError(f"FATAL: invalid publisher manifest signature: {e}")
+    else:
+        if require_auth:
+            raise RuntimeError("FATAL: no signed manifest found (V2E_REQUIRE_AUTH=1)")
+        engine.manifest = PublisherManifest(
+            video_id="demo_v2e_006", publisher_id="publisher_alpha",
+            signed_at=int(time.time()), min_subscriber_tier="paid",
+        )
+        print("[V2E-v6] WARN: unsigned demo manifest (dev mode)")
+
+    # Run OCR transcript indexing on dedicated _ocr_pool
+    await engine._main_loop.run_in_executor(_ocr_pool, engine.load_or_build_transcript, VIDEO_PATH)
+    reaper = asyncio.create_task(engine.reap_expired_loop())
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        for tid in list(engine.active_tabs.keys()):
+            try:
+                await engine.close_and_reap_tab(tid, grace_seconds=0)
+            except Exception:
+                pass
+        for uid in list(engine.workspaces.keys()):
+            try:
+                await engine._reap_workspace(uid)
+            except Exception:
+                pass
+
+
+app = FastAPI(title="V2E SOTA Multi-Tab Bitemporal Engine v6", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ---------------------------------------------------------------------------
+# Auth dependencies
+# ---------------------------------------------------------------------------
+async def verify_subscriber_optional(
+    authorization: Optional[str] = Header(default=None),
+) -> Optional[SubscriberClaims]:
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    if PUBLISHER_AUTH_PUBKEY is None:
+        raise HTTPException(503, "Subscriber auth not configured")
+    try:
+        payload = jwt.decode(
+            authorization[7:], PUBLISHER_AUTH_PUBKEY,
+            algorithms=["EdDSA"], audience="v2e-engine",
+            issuer="publisher-auth",
+        )
+    except PyJWTError:
+        raise HTTPException(401, "Invalid or expired subscriber token")
+    if payload.get("publisher_id") != engine.manifest.publisher_id:
+        raise HTTPException(403, "Subscriber token is for a different publisher")
+    return SubscriberClaims(
+        user_id=payload["sub"], publisher_id=payload["publisher_id"],
+        tier=payload.get("tier", "free"),
+        scope=payload.get("scope", []), exp=payload["exp"],
+    )
+
+
+async def get_cap_token_from_header(
+    x_v2e_cap_token: Optional[str] = Header(default=None),
+) -> CapabilityToken:
+    return engine.resolve_cap_token(x_v2e_cap_token)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.get("/")
+def serve_ui():
+    return FileResponse("static/index.html")
+
+
+@app.get("/tab/{tab_id}")
+def serve_detached_tab_ui(tab_id: str):
+    if tab_id not in engine.active_tabs:
+        raise HTTPException(404, "Detached tab not found")
+    return FileResponse("static/index.html")
+
+
+@app.get("/api/video")
+def serve_video():
+    if not os.path.exists(VIDEO_PATH):
+        raise HTTPException(404, "Demo video not found")
+    return FileResponse(VIDEO_PATH, media_type="video/mp4")
+
+
+@app.get("/api/ledger")
+def get_ledger(
+    claims: Optional[SubscriberClaims] = Depends(verify_subscriber_optional),
+    x_v2e_cap_token: Optional[str] = Header(default=None),
+):
+    cap_token = None
+    can_popout = False
+    reason: Optional[str] = None
+    ws = None
+    subscriber_info = None
+    eff_user_id: Optional[str] = None
+
+    if claims is not None:
+        eff_user_id = claims.user_id
+        subscriber_info = {"user_id": claims.user_id, "tier": claims.tier}
+        if TIER_RANK[claims.tier] < TIER_RANK[engine.manifest.min_subscriber_tier]:
+            reason = f"Requires tier '{engine.manifest.min_subscriber_tier}'"
+        elif "popout" not in claims.scope:
+            reason = "Token scope missing 'popout'"
+        elif not engine.manifest.allow_multi_tab_popout:
+            reason = "Publisher disabled pop-outs for this video"
+        else:
+            cap_token = engine.issue_capability_token(claims)
+            can_popout = True
+            ws = engine.workspaces.get(claims.user_id)
+    elif x_v2e_cap_token and x_v2e_cap_token in engine.valid_cap_tokens:
+        # Allows detached tabs and SSE manifest refreshes holding an active cap-token to stay authenticated
+        cap_obj = engine.valid_cap_tokens[x_v2e_cap_token]
+        eff_user_id = cap_obj.user_id
+        cap_token = cap_obj.token
+        subscriber_info = {"user_id": cap_obj.user_id, "tier": cap_obj.tier}
+        can_popout = (
+            TIER_RANK[cap_obj.tier] >= TIER_RANK[engine.manifest.min_subscriber_tier]
+            and bool(engine.manifest.allow_multi_tab_popout)
+        )
+        if not can_popout:
+            reason = "Pop-outs restricted by publisher manifest"
+        ws = engine.workspaces.get(cap_obj.user_id)
+    else:
+        reason = "Sign in with a paid subscription to unlock pop-outs"
+
+    user_tabs = [
+        {
+            "tab_id": t.tab_id,
+            "component_type": t.component_type,
+            "display_str": t.display_str,
+            "cloned_scrollback_lines": t.cloned_scrollback_lines,
+        }
+        for t in engine.active_tabs.values()
+        if eff_user_id and t.owner_user_id == eff_user_id
+    ]
+
+    return {
+        "capability_token": cap_token,
+        "subscriber": subscriber_info,
+        "can_popout": can_popout,
+        "popout_disabled_reason": reason,
+        "manifest": asdict(engine.manifest),
+        "speaker_roi": engine.speaker_roi,
+        "workspace_roi": engine.workspace_roi,
+        "sub_components": [asdict(c) for c in engine.sub_components.values()],
+        "active_tabs": user_tabs,
+        "workspace_forked": bool(ws and ws.workspace_forked),
+        "fork_display": ws.fork_display if ws else None,
+        "nodes": [asdict(n) for n in engine.ledger],
+    }
+
+
+@app.get("/api/ledger/stream")
+async def stream_ledger_events(
+    ticket: Optional[str] = Query(default=None),
+    claims: Optional[SubscriberClaims] = Depends(verify_subscriber_optional),
+):
+    user_id = claims.user_id if claims else None
+    if not user_id and ticket:
+        entry = engine.ws_tickets.pop(ticket, None)
+        if entry:
+            user_id = entry["user_id"]
+
+    q: asyncio.Queue = asyncio.Queue(maxsize=16)
+    engine.sse_subscribers[q] = user_id
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {data}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            engine.sse_subscribers.pop(q, None)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/ws-ticket")
+async def issue_ws_ticket(
+    x_v2e_cap_token: Optional[str] = Header(default=None),
+):
+    user_id: Optional[str] = None
+    if x_v2e_cap_token:
+        cap = engine.resolve_cap_token(x_v2e_cap_token)
+        user_id = cap.user_id
+    ticket = engine.issue_ws_ticket(user_id)
+    return {"ticket": ticket, "expires_in": 60}
+
+
+@app.post("/api/tabs/spawn")
+async def spawn_new_tab(
+    req: SpawnTabRequest,
+    cap: CapabilityToken = Depends(get_cap_token_from_header),
+):
+    session = await engine.spawn_detached_tab_sandbox(req, cap)
+    return {
+        "status": "SPAWNED",
+        "tab_url": (
+            f"/tab/{session.tab_id}?tab_id={session.tab_id}"
+            f"&display={session.display_str}&component={session.component_type}"
+            f"&ms={session.replay_from_ms}"
+        ),
+        "session": {
+            "tab_id": session.tab_id,
+            "display_str": session.display_str,
+            "component_type": session.component_type,
+            "cloned_scrollback_lines": session.cloned_scrollback_lines,
+        },
+    }
+
+
+@app.post("/api/tabs/{tab_id}/touch", status_code=204)
+async def touch_tab(
+    tab_id: str,
+    cap: CapabilityToken = Depends(get_cap_token_from_header),
+):
+    session = engine.active_tabs.get(tab_id)
+    if not session or session.owner_user_id != cap.user_id:
+        raise HTTPException(404, "Tab not found")
+    session.last_touched = time.time()
+    return Response(status_code=204)
+
+
+@app.post("/api/tabs/{tab_id}/close")
+async def close_tab(
+    tab_id: str,
+    requested_by: Optional[str] = Query(default=None),
+    x_v2e_cap_token: Optional[str] = Header(default=None),
+    token: Optional[str] = Query(default=None),
+):
+    eff = x_v2e_cap_token or token
+    cap = engine.resolve_cap_token(eff)
+    return await engine.close_and_reap_tab(
+        tab_id, requested_by=requested_by, requesting_user=cap.user_id,
+    )
+
+
+@app.post("/api/pointer")
+async def handle_pointer(
+    req: PointerEventRequest,
+    cap: CapabilityToken = Depends(get_cap_token_from_header),
+):
+    return await engine.route_pointer(req, cap)
+
+
+@app.post("/api/keyboard")
+async def handle_keyboard(
+    req: KeyEventRequest,
+    cap: CapabilityToken = Depends(get_cap_token_from_header),
+):
+    return engine.send_keystrokes(req.key_text, cap, req.target_display)
+
+
+@app.post("/api/resync")
+async def handle_resync(
+    req: ResyncRequest,
+    cap: CapabilityToken = Depends(get_cap_token_from_header),
+):
+    return await engine.resync(req, cap)
+
+
+@app.websocket("/ws/subscreen")
+async def stream_subscreen(
+    websocket: WebSocket,
+    ticket: str,
+    display: Optional[str] = None,
+):
+    entry = engine.ws_tickets.pop(ticket, None)
+    if not entry:
+        await websocket.close(code=1008)
+        return
+    user_id = entry["user_id"]
+
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    interval = 1.0 / 20.0
+    last = 0.0
+    last_checked_disp: Optional[str] = None
+
+    try:
+        while True:
+            if display:
+                target = display
+            else:
+                ws_obj = engine.workspaces.get(user_id) if user_id else None
+                target = ws_obj.fork_display if (ws_obj and ws_obj.workspace_forked) else engine.display_trunk
+
+            if target != last_checked_disp:
+                engine._assert_display_ownership(target, user_id)
+                last_checked_disp = target
+
+            now = time.monotonic()
+            wait = interval - (now - last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            jpeg = await loop.run_in_executor(_capture_pool, engine.capture_x11_shm_jpeg, target)
+            await websocket.send_bytes(jpeg)
+            await websocket.receive_text()
+            last = time.monotonic()
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    except HTTPException:
+        await websocket.close(code=1008)
+
+```
+### 2. static/index.html
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>V2E SOTA Multi-Tab Studio v6</title>
+  <style>
+    :root{--bg:#0b0f17;--panel:#161b22;--border:#30363d;--cyan:#38bdf8;--amber:#f59e0b;
+          --green:#3fb950;--purple:#a855f7;--red:#ef4444;--text:#e6edf3;}
+    *{box-sizing:border-box;margin:0;padding:0;font-family:system-ui,sans-serif;}
+    body{background:var(--bg);color:var(--text);display:flex;height:100vh;overflow:hidden;}
+    .stage{flex:1;display:flex;flex-direction:column;padding:14px;gap:10px;overflow-y:auto;}
+    .top{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;
+         background:var(--panel);padding:10px 14px;border-radius:8px;border:1px solid var(--border);}
+    .popout-group{display:flex;gap:6px;flex-wrap:wrap;}
+    .vp{position:relative;width:100%;max-width:1100px;aspect-ratio:16/9;background:#000;
+        border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+    video{width:100%;height:100%;object-fit:fill;display:block;}
+    #subscreenCanvas{position:absolute;left:3.125%;top:5.55%;width:71.875%;height:83.33%;
+        border:2px solid transparent;border-radius:6px;cursor:crosshair;z-index:2;
+        transition:border-color .15s;}
+    #subscreenCanvas.forked{border-color:var(--green);box-shadow:0 0 20px rgba(63,185,80,.35);}
+    #subscreenCanvas.detached{position:static;width:100%;height:100%;
+        border:2px solid var(--purple);cursor:default;}
+    #speakerHitbox{position:absolute;left:76.56%;top:66.66%;width:20.31%;height:27.77%;
+        border:2px dashed var(--amber);border-radius:8px;z-index:3;cursor:pointer;
+        display:flex;align-items:flex-end;justify-content:center;padding-bottom:6px;
+        font-size:11px;color:var(--amber);font-weight:700;letter-spacing:.06em;
+        background:rgba(245,158,11,.08);text-shadow:0 1px 2px #000;text-align:center;}
+
+    .hud{display:flex;gap:14px;align-items:center;font-size:12px;color:#8b949e;
+        padding:0 4px;flex-wrap:wrap;}
+    .hud .badge{padding:3px 8px;border-radius:10px;font-size:11px;
+        background:#21262d;border:1px solid var(--border);font-family:monospace;}
+    .hud .badge.sub-locked{background:rgba(239,68,68,.12);color:var(--red);
+        border-color:rgba(239,68,68,.4);}
+    .popout-btn{padding:6px 10px;border-radius:6px;font-size:12px;font-weight:600;
+        border:1px solid var(--border);background:#21262d;color:var(--text);
+        cursor:pointer;transition:all .15s;}
+    .popout-btn:hover:not(:disabled){background:#30363d;border-color:var(--cyan);}
+    .popout-btn:disabled{opacity:.4;cursor:not-allowed;}
+
+    .sidebar{width:340px;display:flex;flex-direction:column;background:var(--panel);
+        border-left:1px solid var(--border);overflow:hidden;}
+    .sidebar-header{padding:12px 14px;border-bottom:1px solid var(--border);
+        font-size:12px;font-weight:700;letter-spacing:.08em;color:var(--cyan);}
+    .ledger{flex:1;overflow-y:auto;padding:10px;}
+    .ledger-node{padding:8px 10px;border-radius:6px;margin-bottom:6px;
+        background:#0d1117;border:1px solid var(--border);font-size:12px;}
+    .ledger-node .ts{color:var(--cyan);font-family:monospace;font-size:11px;}
+    .ledger-node .cmd{color:var(--green);font-family:monospace;font-size:11px;
+        margin-top:4px;word-break:break-all;}
+
+    .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+        padding:10px 18px;background:#21262d;border:1px solid var(--border);
+        border-radius:8px;font-size:13px;z-index:100;opacity:0;
+        transition:opacity .2s;pointer-events:none;max-width:90vw;
+        box-shadow:0 8px 24px rgba(0,0,0,.5);}
+    .toast.show{opacity:1;}
+
+    /* WS subscreen render target — overlays the subscreen ROI in main tab, or full viewport in detached */
+    #wsCanvas{position:absolute;left:3.125%;top:5.55%;width:71.875%;height:83.33%;z-index:1;
+        display:none;background:#000;pointer-events:none;border-radius:6px;}
+    #wsCanvas.forked{display:block;}
+
+    /* Detached-tab mode: full-viewport subscreen */
+    body.detached{display:block;padding:0;background:#000;overflow:hidden;}
+    body.detached .top,body.detached .sidebar,body.detached .vp>video,
+    body.detached #speakerHitbox,body.detached .hud{display:none;}
+    body.detached .stage{height:100vh;padding:0;gap:0;overflow:hidden;max-width:none;}
+    body.detached .vp{max-width:none;width:100vw;height:100vh;aspect-ratio:auto;
+        border:none;border-radius:0;}
+    body.detached #subscreenCanvas.detached{border:none;cursor:crosshair;}
+    body.detached #wsCanvas{display:block;left:0;top:0;width:100%;height:100%;border-radius:0;}
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <div class="top">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <strong style="font-size:14px;">V2E Multi-Tab Studio v6</strong>
+        <span id="manifestInfo" style="font-size:11px;color:#8b949e;font-family:monospace;"></span>
+      </div>
+      <div class="hud">
+        <span id="subBadge" class="badge">…</span>
+        <div class="popout-group" id="popoutGroup">
+          <button class="popout-btn" data-component="FULL_WORKSPACE" disabled>Full Workspace</button>
+          <button class="popout-btn" data-component="IDE_EDITOR" disabled>Code Editor</button>
+          <button class="popout-btn" data-component="TERMINAL" disabled>Terminal</button>
+          <button class="popout-btn" data-component="VIEWPORT_PREVIEW" disabled>Viewport</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="vp" id="vpRoot">
+      <video id="vid" autoplay muted loop playsinline></video>
+      <canvas id="subscreenCanvas" width="920" height="600"></canvas>
+      <div id="speakerHitbox">SPEAKER STREAM</div>
+      <canvas id="wsCanvas"></canvas>
+    </div>
+
+    <div class="hud">
+      <span id="forkStatus">Workspace: shared trunk</span>
+      <span id="speakerStatus">Speaker: playing</span>
+      <span id="tabCount">Tabs: 0</span>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <div class="sidebar-header">BITEMPORAL SYNC LEDGER</div>
+    <div class="ledger" id="ledgerList"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // -------------------------------------------------------------------
+  // State
+  // -------------------------------------------------------------------
+  const state = {
+    capToken: null,
+    canPopout: false,
+    subscriber: null,
+    manifest: null,
+    ledger: [],
+    activeTabs: [],
+    workspaceForked: false,
+    speakerPlaying: true,
+    forkDisplay: null,
+    detachedTabId: null,
+    detachedDisplay: null,
+    detachedComponent: null,
+    detachedMs: 0,
+    wsConn: null,
+    sseConn: null,
+    lastSpeakerMs: 0,
+    bootstrapped: false,
+  };
+
+  const pathMatch = location.pathname.match(/^\/tab\/([^/]+)$/);
+  if (pathMatch) {
+    state.detachedTabId = decodeURIComponent(pathMatch[1]);
+    const qs = new URLSearchParams(location.search);
+    state.detachedDisplay = qs.get('display');
+    state.detachedComponent = qs.get('component');
+    state.detachedMs = parseInt(qs.get('ms') || '0', 10) || 0;
+    document.body.classList.add('detached');
+  }
+
+  // -------------------------------------------------------------------
+  // Helpers
+  // -------------------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  function toast(msg, ms) {
+    const t = $('toast');
+    if (!t) return;
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(t._t);
+    t._t = setTimeout(() => t.classList.remove('show'), ms || 2500);
+  }
+
+  function getSpeakerMs() {
+    if (state.detachedTabId) return state.lastSpeakerMs || 0;
+    const v = $('vid');
+    return v ? Math.floor(v.currentTime * 1000) : 0;
+  }
+
+  function apiHeaders(extra) {
+    const h = Object.assign({}, extra || {});
+    if (state.capToken) h['X-V2E-Cap-Token'] = state.capToken;
+    return h;
+  }
+
+  async function fetchOneTimeTicket() {
+    const res = await fetch('/api/ws-ticket', {
+      method: 'POST',
+      headers: apiHeaders({}),
+    });
+    if (!res.ok) throw new Error('ticket ' + res.status);
+    const j = await res.json();
+    return j.ticket;
+  }
+
+  // -------------------------------------------------------------------
+  // Bootstrap
+  // -------------------------------------------------------------------
+  async function bootstrap() {
+    try {
+      const cached = localStorage.getItem('v2e_cap_token');
+      if (cached && !state.capToken) state.capToken = cached;
+    } catch (_) {}
+
+    // If this is a detached tab reloading within the 2s beacon grace period, touch immediately to revive
+    if (state.detachedTabId && state.capToken) {
+      fetch('/api/tabs/' + encodeURIComponent(state.detachedTabId) + '/touch', {
+        method: 'POST',
+        headers: apiHeaders({}),
+      }).catch(() => {});
+    }
+
+    try {
+      const res = await fetch('/api/ledger', { headers: apiHeaders({}) });
+      if (!res.ok) throw new Error('ledger ' + res.status);
+      const data = await res.json();
+      state.capToken = data.capability_token || state.capToken;
+      state.canPopout = !!data.can_popout;
+      state.subscriber = data.subscriber;
+      state.manifest = data.manifest;
+      state.ledger = data.nodes || [];
+      state.activeTabs = data.active_tabs || [];
+      state.workspaceForked = !!data.workspace_forked;
+      state.forkDisplay = data.fork_display || null;
+    } catch (e) {
+      toast('Failed to load engine state: ' + e.message);
+      console.error(e);
+    }
+
+    if (!state.detachedTabId) {
+      try {
+        if (state.capToken) localStorage.setItem('v2e_cap_token', state.capToken);
+        else localStorage.removeItem('v2e_cap_token');
+      } catch (_) {}
+
+      const v = $('vid');
+      if (v) v.src = '/api/video';
+    }
+
+    applyLedger();
+    applySubscriberBadge();
+    applyPopoutState();
+    applyWorkspaceState();
+    wireUI();
+    setupBroadcastChannel();
+    await connectSSE();
+    await connectSubscreenWS();
+    state.bootstrapped = true;
+  }
+
+  // -------------------------------------------------------------------
+  // Renderers
+  // -------------------------------------------------------------------
+  function applyLedger() {
+    const list = $('ledgerList');
+    if (!list) return;
+    const frag = document.createDocumentFragment();
+    for (const n of state.ledger) {
+      const div = document.createElement('div');
+      div.className = 'ledger-node';
+      div.innerHTML =
+        '<div class="ts">t=' + n.timestamp_ms + 'ms  #' + n.node_id + '</div>' +
+        '<div>' + escapeHtml(n.spoken_text) + '</div>' +
+        '<div class="cmd">$ ' + escapeHtml(n.inferred_cmd) + '</div>';
+      frag.appendChild(div);
+    }
+    list.innerHTML = '';
+    list.appendChild(frag);
+    const mi = $('manifestInfo');
+    if (mi && state.manifest) {
+      mi.textContent = 'video=' + state.manifest.video_id +
+        ' · tier=' + state.manifest.min_subscriber_tier;
+    }
+  }
+
+  function applySubscriberBadge() {
+    const badge = $('subBadge');
+    if (!badge) return;
+    if (state.subscriber) {
+      badge.textContent = state.subscriber.tier.toUpperCase() + ' · ' + state.subscriber.user_id;
+      badge.classList.remove('sub-locked');
+    } else {
+      badge.textContent = 'FREE VIEWER';
+      badge.classList.add('sub-locked');
+    }
+  }
+
+  function applyPopoutState() {
+    const reason = state.canPopout ? '' : 'Subscribe for pop-outs';
+    for (const btn of document.querySelectorAll('.popout-btn')) {
+      btn.disabled = !state.canPopout;
+      btn.title = reason;
+    }
+  }
+
+  function applyWorkspaceState() {
+    const f = $('forkStatus'), s = $('speakerStatus'), t = $('tabCount');
+    if (f) f.textContent = state.workspaceForked
+      ? 'Workspace: forked ' + (state.forkDisplay || '')
+      : 'Workspace: shared trunk';
+    if (s) s.textContent = state.speakerPlaying ? 'Speaker: playing' : 'Speaker: paused';
+    if (t) t.textContent = 'Tabs: ' + state.activeTabs.length;
+
+    const canvas = $('subscreenCanvas');
+    if (canvas) {
+      canvas.classList.toggle('forked', state.workspaceForked);
+      canvas.classList.toggle('detached', !!state.detachedTabId);
+    }
+
+    const wsCanvas = $('wsCanvas');
+    if (wsCanvas) {
+      wsCanvas.classList.toggle('forked', state.workspaceForked);
+    }
+
+    const v = $('vid');
+    if (v && !state.detachedTabId) {
+      if (state.speakerPlaying && v.paused) v.play().catch(() => {});
+      else if (!state.speakerPlaying && !v.paused) v.pause();
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // UI wiring
+  // -------------------------------------------------------------------
+  function wireUI() {
+    for (const btn of document.querySelectorAll('.popout-btn')) {
+      btn.addEventListener('click', () => spawnTab(btn.dataset.component));
+    }
+
+    const canvas = $('subscreenCanvas');
+    if (canvas) {
+      canvas.addEventListener('click', (e) => {
+        const r = canvas.getBoundingClientRect();
+        const normX = (e.clientX - r.left) / Math.max(r.width, 1);
+        const normY = (e.clientY - r.top) / Math.max(r.height, 1);
+
+        if (state.detachedTabId) {
+          // Detached tab: map [0..1] across full 1280x720 payload and specify target_display
+          sendPointer(Math.round(normX * 1280), Math.round(normY * 720), state.detachedDisplay);
+        } else {
+          // Main tab: #subscreenCanvas covers the workspace ROI (40, 40, 920, 600) inside 1280x720
+          const px = Math.round(40 + normX * 920);
+          const py = Math.round(40 + normY * 600);
+          sendPointer(px, py, null);
+        }
+      });
+    }
+
+    const sp = $('speakerHitbox');
+    if (sp) {
+      sp.addEventListener('click', () => sendPointer(1100, 580, null));
+    }
+
+    window.addEventListener('keydown', handleKeydown, { capture: true });
+  }
+
+  // -------------------------------------------------------------------
+  // Keyboard bridge (active in detached tab OR forked main tab)
+  // -------------------------------------------------------------------
+  const kbuf = { text: '' };
+  function handleKeydown(e) {
+    const activeTarget = state.detachedTabId
+      ? state.detachedDisplay
+      : (state.workspaceForked ? state.forkDisplay : null);
+    if (!activeTarget) return;
+    if (!state.capToken) { toast('Sign in to type'); return; }
+
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const cmd = kbuf.text.trim();
+      kbuf.text = '';
+      if (!cmd) return;
+      fetch('/api/keyboard', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          key_text: cmd,
+          target_display: activeTarget,
+        }),
+      }).catch((err) => toast('keystroke failed: ' + err.message));
+      return;
+    }
+
+    if (e.key === 'Backspace') { e.preventDefault(); kbuf.text = kbuf.text.slice(0, -1); return; }
+    if (e.key === 'Escape') { kbuf.text = ''; return; }
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      kbuf.text += e.key;
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pointer
+  // -------------------------------------------------------------------
+  async function sendPointer(px, py, targetDisplay) {
+    if (!state.capToken) { toast('Subscribe to interact'); return; }
+    try {
+      const payload = {
+        px: px, py: py,
+        video_width: 1280, video_height: 720,
+        current_speaker_ms: getSpeakerMs(),
+      };
+      if (targetDisplay) payload.target_display = targetDisplay;
+
+      const res = await fetch('/api/pointer', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.hit_target === 'RESTRICTED') {
+        toast(data.message || 'Restricted');
+        return;
+      }
+      const prevFork = state.forkDisplay;
+      if (typeof data.speaker_playing === 'boolean') state.speakerPlaying = data.speaker_playing;
+      if (typeof data.workspace_forked === 'boolean') state.workspaceForked = data.workspace_forked;
+      if (data.fork_display && !state.detachedTabId) state.forkDisplay = data.fork_display;
+      applyWorkspaceState();
+
+      if (data.hit_target === 'WORKSPACE_SUBSCREEN' && data.fork_display && data.fork_display !== prevFork) {
+        connectSubscreenWS();
+      }
+    } catch (e) {
+      toast('pointer failed: ' + e.message);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Pop-out
+  // -------------------------------------------------------------------
+  async function spawnTab(component) {
+    if (!state.canPopout || !state.capToken) { toast('Pop-outs require a paid subscription'); return; }
+    try {
+      const res = await fetch('/api/tabs/spawn', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          component_type: component,
+          replay_from_ms: getSpeakerMs(),
+          clone_live_fork_state: true,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        toast(err.detail || ('spawn failed ' + res.status));
+        return;
+      }
+      const data = await res.json();
+      window.open(data.tab_url, '_blank', 'noopener');
+    } catch (e) {
+      toast('spawn failed: ' + e.message);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Ticket-authenticated SSE
+  // -------------------------------------------------------------------
+  async function connectSSE() {
+    if (state.sseConn) {
+      try { state.sseConn.close(); } catch (_) {}
+      state.sseConn = null;
+    }
+
+    let url = '/api/ledger/stream';
+    if (state.capToken) {
+      try {
+        const ticket = await fetchOneTimeTicket();
+        url += '?ticket=' + encodeURIComponent(ticket);
+      } catch (e) {
+        console.warn('[v2e] SSE ticket exchange failed, falling back to anonymous SSE', e);
+      }
+    }
+
+    const es = new EventSource(url);
+    state.sseConn = es;
+
+    es.onmessage = (ev) => {
+      if (!ev.data || ev.data[0] === ':') return;
+      let d;
+      try { d = JSON.parse(ev.data); } catch (_) { return; }
+
+      const manifestChanged = d.manifest && JSON.stringify(d.manifest) !== JSON.stringify(state.manifest);
+      if (d.manifest) state.manifest = d.manifest;
+      if (Array.isArray(d.active_tabs)) state.activeTabs = d.active_tabs;
+      if (typeof d.workspace_forked === 'boolean') state.workspaceForked = d.workspace_forked;
+      if (typeof d.speaker_playing === 'boolean') state.speakerPlaying = d.speaker_playing;
+      if (d.fork_display !== undefined) state.forkDisplay = d.fork_display;
+      applyWorkspaceState();
+
+      if (manifestChanged) refreshAuthState();
+    };
+
+    es.onerror = () => {
+      // Single-use ticket cannot be reused by browser auto-reconnect; close and re-issue ticket
+      try { es.close(); } catch (_) {}
+      state.sseConn = null;
+      if (!document.hidden && state.bootstrapped) {
+        setTimeout(() => connectSSE(), 3000);
+      }
+    };
+  }
+
+  async function refreshAuthState() {
+    try {
+      const res = await fetch('/api/ledger', { headers: apiHeaders({}) });
+      const data = await res.json();
+      state.canPopout = !!data.can_popout;
+      applyPopoutState();
+      applySubscriberBadge();
+    } catch (_) {}
+  }
+
+  // -------------------------------------------------------------------
+  // Subscreen WS stream — via one-use ticket
+  // -------------------------------------------------------------------
+  async function connectSubscreenWS() {
+    let target = null;
+    if (state.detachedTabId) {
+      target = state.detachedDisplay || state.forkDisplay || null;
+    } else if (state.workspaceForked && state.forkDisplay) {
+      target = state.forkDisplay;
+    }
+
+    let ticket;
+    try {
+      ticket = await fetchOneTimeTicket();
+    } catch (e) {
+      console.warn('[v2e] ws-ticket failed', e);
+      return;
+    }
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const qs = new URLSearchParams({ ticket: ticket });
+    if (target) qs.set('display', target);
+    const url = proto + '//' + location.host + '/ws/subscreen?' + qs;
+
+    if (state.wsConn) {
+      try { state.wsConn.close(); } catch (_) {}
+    }
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    state.wsConn = ws;
+
+    const wsCanvas = $('wsCanvas');
+    const ctx = wsCanvas ? wsCanvas.getContext('2d') : null;
+
+    ws.onopen = () => {
+      if (wsCanvas) {
+        wsCanvas.width = 1024;
+        wsCanvas.height = 768;
+      }
+    };
+
+    ws.onmessage = async (ev) => {
+      if (!ctx || !ev.data) return;
+      try {
+        const blob = new Blob([ev.data], { type: 'image/jpeg' });
+        const bmp = await createImageBitmap(blob);
+        ctx.drawImage(bmp, 0, 0, wsCanvas.width, wsCanvas.height);
+        if (bmp.close) bmp.close();
+      } catch (_) {}
+      try { ws.send('ack'); } catch (_) {}
+    };
+
+    ws.onerror = () => {};
+
+    ws.onclose = (ev) => {
+      state.wsConn = null;
+      if (ev && ev.code === 1008) {
+        toast('Subscreen access denied');
+        return;
+      }
+      if (!document.hidden && state.bootstrapped) {
+        setTimeout(() => connectSubscreenWS(), 2000);
+      }
+    };
+  }
+
+  // -------------------------------------------------------------------
+  // Synchronous beacon on pagehide + revival via /touch on reload
+  // -------------------------------------------------------------------
+  window.addEventListener('pagehide', (event) => {
+    if (event.persisted) return;
+    if (!state.detachedTabId || !state.capToken) return;
+    const url = '/api/tabs/' +
+      encodeURIComponent(state.detachedTabId) +
+      '/close?requested_by=beacon&token=' +
+      encodeURIComponent(state.capToken);
+    try { navigator.sendBeacon(url); } catch (_) {}
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!state.bootstrapped) return;
+    if (!state.wsConn || state.wsConn.readyState > 1) {
+      connectSubscreenWS();
+    }
+    if (!state.sseConn || state.sseConn.readyState === 2) {
+      connectSSE();
+    }
+    refreshAuthState();
+  });
+
+  // -------------------------------------------------------------------
+  // BroadcastChannel — live speaker timestamp heartbeat
+  // -------------------------------------------------------------------
+  function setupBroadcastChannel() {
+    if (typeof BroadcastChannel === 'undefined') return;
+    if (!state.detachedTabId) {
+      const bc = new BroadcastChannel('v2e_speaker');
+      setInterval(() => {
+        try {
+          bc.postMessage({ speakerMs: getSpeakerMs(), ts: Date.now() });
+        } catch (_) {}
+      }, 500);
+    } else {
+      const bc = new BroadcastChannel('v2e_speaker');
+      bc.onmessage = (ev) => {
+        if (ev.data && typeof ev.data.speakerMs === 'number') {
+          state.lastSpeakerMs = ev.data.speakerMs;
+        }
+      };
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Go
+  // -------------------------------------------------------------------
+  bootstrap();
+})();
+</script>
+</body>
+</html>
+
+```

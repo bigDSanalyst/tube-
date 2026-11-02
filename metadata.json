@@ -1,0 +1,6 @@
+{
+  "name": "V2E Multi-Tab Bitemporal Studio",
+  "description": "Video-to-Execution Multi-Tab Bitemporal Studio with Speaker PiP Decoupling, Publisher Permission Governance, and Multi-Tenant Virtual Display Component Demuxer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
